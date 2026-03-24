@@ -69,6 +69,7 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    apply_observation_crops,
     get_logger,
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
@@ -406,6 +407,7 @@ class RobotClient:
             start_time = time.perf_counter()
 
             raw_observation: RawObservation = self.robot.get_observation()
+            raw_observation = apply_observation_crops(raw_observation, self.config.image_crop_params)
             raw_observation["task"] = task
 
             with self.latest_action_lock:

@@ -136,6 +136,12 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    image_crop_params: dict[str, tuple[int, int, int, int]] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Optional per-camera crop parameters as (top, left, height, width), applied on the client before sending observations"
+        },
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -179,6 +185,26 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        normalized_crop_params = {}
+        for key, value in self.image_crop_params.items():
+            if len(value) != 4:
+                raise ValueError(
+                    f"image_crop_params['{key}'] must have four values (top, left, height, width), got {value}"
+                )
+
+            top, left, height, width = (int(v) for v in value)
+            if top < 0 or left < 0:
+                raise ValueError(
+                    f"image_crop_params['{key}'] must use non-negative top/left offsets, got {value}"
+                )
+            if height <= 0 or width <= 0:
+                raise ValueError(
+                    f"image_crop_params['{key}'] must use positive height/width, got {value}"
+                )
+
+            normalized_crop_params[key] = (top, left, height, width)
+
+        self.image_crop_params = normalized_crop_params
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -197,6 +223,7 @@ class RobotClientConfig:
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
+            "image_crop_params": self.image_crop_params,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,

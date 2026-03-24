@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 from queue import Queue
 
+import numpy as np
 import pytest
 import torch
 
@@ -231,3 +232,88 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_robot_client_config_normalizes_image_crop_params():
+    """Crop config should accept sequence input and serialize normalized tuples."""
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        image_crop_params={"front": [0, 80, 480, 480]},
+    )
+
+    assert cfg.image_crop_params == {"front": (0, 80, 480, 480)}
+    assert cfg.to_dict()["image_crop_params"] == {"front": (0, 80, 480, 480)}
+
+
+def test_control_loop_observation_applies_client_side_crops(robot_client, monkeypatch):
+    """Observations should be cropped on the client before serialization."""
+    front = np.arange(480 * 640 * 3, dtype=np.uint8).reshape(480, 640, 3)
+    captured = {}
+
+    robot_client.config.image_crop_params = {"front": (0, 80, 480, 480)}
+    robot_client.latest_action = 3
+    robot_client.action_queue = Queue()
+    robot_client.must_go.set()
+
+    monkeypatch.setattr(
+        robot_client.robot,
+        "get_observation",
+        lambda: {"front": front.copy(), "motor_1.pos": 1.0},
+    )
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda obs: captured.setdefault("timed_observation", obs) or True,
+    )
+
+    observation = robot_client.control_loop_observation(task="pick")
+
+    assert observation["front"].shape == (480, 480, 3)
+    np.testing.assert_array_equal(observation["front"], front[:, 80:560, :])
+    assert observation["task"] == "pick"
+    assert captured["timed_observation"].get_observation()["front"].shape == (480, 480, 3)
+    assert captured["timed_observation"].must_go is True
+    assert not robot_client.must_go.is_set()
+
+
+# -----------------------------------------------------------------------------
+# Regression test: robot type registry populated by robot_client imports
+# -----------------------------------------------------------------------------
+
+
+def test_robot_client_registers_builtin_robot_types():
+    """Importing robot_client must populate RobotConfig's ChoiceRegistry.
+
+    This is a regression test for a bug introduced in #2425, where removing
+    robot module imports from robot_client.py caused RobotConfig's registry to
+    be empty, breaking CLI argument parsing with:
+      error: argument --robot.type: invalid choice: 'so101_follower' (choose from )
+
+    Robot types are registered via @RobotConfig.register_subclass() decorators
+    at import time, so all supported modules must be explicitly imported.
+    """
+    import lerobot.async_inference.robot_client  # noqa: F401
+    from lerobot.robots.config import RobotConfig
+
+    known_choices = RobotConfig.get_known_choices()
+
+    expected_robot_types = [
+        "so100_follower",
+        "so101_follower",
+        "koch_follower",
+        "omx_follower",
+        "bi_so_follower",
+    ]
+    for robot_type in expected_robot_types:
+        assert robot_type in known_choices, (
+            f"Robot type '{robot_type}' is not registered in RobotConfig's ChoiceRegistry. "
+            f"Ensure the corresponding module is imported in robot_client.py. "
+            f"Known choices: {sorted(known_choices)}"
+        )

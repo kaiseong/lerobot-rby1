@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.configs.types import PolicyFeature
@@ -69,6 +70,46 @@ def map_robot_keys_to_lerobot_features(robot: Robot) -> dict[str, dict]:
 
 def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
+
+
+def crop_raw_observation_image(image: np.ndarray | torch.Tensor, crop_params: tuple[int, int, int, int]) -> Any:
+    """Crop a raw HWC image using (top, left, height, width)."""
+    if getattr(image, "ndim", None) != 3:
+        raise ValueError(f"Expected an image with 3 dimensions (H, W, C), got {getattr(image, 'shape', None)}")
+
+    top, left, height, width = crop_params
+    image_height, image_width = image.shape[:2]
+    bottom = top + height
+    right = left + width
+    if bottom > image_height or right > image_width:
+        raise ValueError(
+            f"Crop {crop_params} exceeds image bounds {(image_height, image_width)}"
+        )
+
+    cropped = image[top:bottom, left:right, ...]
+    if isinstance(cropped, np.ndarray):
+        return np.ascontiguousarray(cropped)
+    if isinstance(cropped, torch.Tensor):
+        return cropped.contiguous()
+
+    return cropped
+
+
+def apply_observation_crops(
+    raw_observation: RawObservation, crop_params_dict: dict[str, tuple[int, int, int, int]]
+) -> RawObservation:
+    """Apply per-camera crops to a raw robot observation before network transfer."""
+    if not crop_params_dict:
+        return raw_observation
+
+    cropped_observation = dict(raw_observation)
+    for key, crop_params in crop_params_dict.items():
+        if key not in raw_observation:
+            raise KeyError(f"Crop requested for missing observation key '{key}'")
+
+        cropped_observation[key] = crop_raw_observation_image(raw_observation[key], crop_params)
+
+    return cropped_observation
 
 
 def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, int, int]) -> torch.tensor:

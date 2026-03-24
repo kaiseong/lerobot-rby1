@@ -17,12 +17,15 @@ import pickle
 import time
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.async_inference.helpers import (
     FPSTracker,
     TimedAction,
     TimedObservation,
+    apply_observation_crops,
+    crop_raw_observation_image,
     observations_similar,
     prepare_image,
     prepare_raw_observation,
@@ -277,6 +280,50 @@ def test_prepare_image():
 
     # Check memory contiguity
     assert processed.is_contiguous()
+
+
+def test_crop_raw_observation_image():
+    """Cropping should preserve the selected HWC region and return a contiguous array."""
+    image = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
+
+    cropped = crop_raw_observation_image(image, (1, 2, 4, 4))
+
+    assert cropped.shape == (4, 4, 3)
+    assert cropped.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(cropped, image[1:5, 2:6, :])
+
+
+def test_apply_observation_crops_preserves_non_image_fields():
+    """Per-camera crop should only affect configured image entries."""
+    front = np.arange(480 * 640 * 3, dtype=np.uint8).reshape(480, 640, 3)
+    right = np.arange(640 * 480 * 3, dtype=np.uint8).reshape(640, 480, 3)
+    observation = {
+        "front": front,
+        "right": right,
+        "shoulder": 1.0,
+        "task": "pick",
+    }
+
+    cropped = apply_observation_crops(
+        observation,
+        {
+            "front": (0, 80, 480, 480),
+            "right": (160, 0, 480, 480),
+        },
+    )
+
+    assert cropped["front"].shape == (480, 480, 3)
+    assert cropped["right"].shape == (480, 480, 3)
+    assert cropped["shoulder"] == 1.0
+    assert cropped["task"] == "pick"
+    np.testing.assert_array_equal(cropped["front"], front[:, 80:560, :])
+    np.testing.assert_array_equal(cropped["right"], right[160:640, :, :])
+
+
+def test_apply_observation_crops_missing_key_raises():
+    """Misconfigured crop keys should fail fast instead of silently skipping."""
+    with pytest.raises(KeyError, match="missing observation key"):
+        apply_observation_crops({"front": np.zeros((4, 4, 3), dtype=np.uint8)}, {"right": (0, 0, 2, 2)})
 
 
 def test_resize_robot_observation_image():
