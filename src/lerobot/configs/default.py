@@ -21,20 +21,103 @@ from lerobot.datasets.video_utils import get_safe_default_codec
 
 
 @dataclass
-class DatasetConfig:
-    # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
-    # keys common between the datasets are kept. Each dataset gets and additional transform that inserts the
-    # "dataset_index" into the returned item. The index mapping is made according to the order in which the
-    # datasets are provided.
+class DatasetCropConfig:
+    enable: bool = False
+    resize_size: tuple[int, int] = (128, 128)
+    params: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if len(self.resize_size) != 2:
+            raise ValueError(f"resize_size must contain two values, got {self.resize_size}")
+
+        resize_height, resize_width = (int(v) for v in self.resize_size)
+        if resize_height <= 0 or resize_width <= 0:
+            raise ValueError(f"resize_size must use positive values, got {self.resize_size}")
+        self.resize_size = (resize_height, resize_width)
+
+        normalized_params = {}
+        for key, value in self.params.items():
+            if len(value) != 4:
+                raise ValueError(
+                    f"dataset.crop.params['{key}'] must have four values (top, left, height, width), got {value}"
+                )
+
+            top, left, height, width = (int(v) for v in value)
+            if top < 0 or left < 0:
+                raise ValueError(
+                    f"dataset.crop.params['{key}'] must use non-negative top/left offsets, got {value}"
+                )
+            if height <= 0 or width <= 0:
+                raise ValueError(
+                    f"dataset.crop.params['{key}'] must use positive height/width, got {value}"
+                )
+
+            normalized_params[key] = (top, left, height, width)
+
+        self.params = normalized_params
+
+
+@dataclass
+class DatasetSourceConfig:
     repo_id: str
-    # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | None = None
     episodes: list[int] | None = None
+    revision: str | None = None
+    adapter: str = ""
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.adapter = self.adapter.strip()
+        if not self.repo_id:
+            raise ValueError("dataset.sources[*].repo_id must be provided")
+        if not self.adapter:
+            raise ValueError(f"dataset.sources[{self.repo_id}] must define an adapter")
+        self.weight = float(self.weight)
+        if self.weight <= 0:
+            raise ValueError(f"dataset.sources[{self.repo_id}].weight must be positive, got {self.weight}")
+
+
+@dataclass
+class DatasetConfig:
+    repo_id: str = ""
+    root: str | None = None
+    episodes: list[int] | None = None
+    sources: list[DatasetSourceConfig] = field(default_factory=list)
+    mixing_strategy: str = "uniform"
+    crop: DatasetCropConfig = field(default_factory=DatasetCropConfig)
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mixing_strategy not in {"uniform", "manual"}:
+            raise ValueError(
+                f"dataset.mixing_strategy must be one of ['uniform', 'manual'], got {self.mixing_strategy}"
+            )
+
+        if self.sources:
+            if self.repo_id:
+                raise ValueError("Use either dataset.repo_id or dataset.sources, not both")
+            if self.root is not None:
+                raise ValueError("dataset.root is only supported for single-dataset training")
+            if self.episodes is not None:
+                raise ValueError("dataset.episodes is only supported for single-dataset training")
+            if self.revision is not None:
+                raise ValueError("dataset.revision is only supported for single-dataset training")
+            if self.crop.enable:
+                raise ValueError("dataset.crop is not supported together with dataset.sources")
+            if self.streaming:
+                raise ValueError("dataset.streaming is not supported together with dataset.sources")
+            if self.mixing_strategy == "manual":
+                for source in self.sources:
+                    if source.weight <= 0:
+                        raise ValueError(
+                            f"dataset.sources[{source.repo_id}].weight must be positive when using manual mixing"
+                        )
+        elif not self.repo_id:
+            raise ValueError("Either dataset.repo_id or dataset.sources must be provided")
 
 
 @dataclass

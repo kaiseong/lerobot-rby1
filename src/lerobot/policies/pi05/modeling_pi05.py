@@ -215,6 +215,46 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     return padded_images
 
 
+def get_image_valid_mask(batch: dict[str, Tensor], image_key: str, batch_size: int, device: torch.device) -> Tensor:
+    missing_key = f"{image_key}_is_missing"
+    missing = batch.get(missing_key)
+    if missing is None:
+        return torch.ones(batch_size, dtype=torch.bool, device=device)
+
+    if not isinstance(missing, torch.Tensor):
+        missing = torch.as_tensor(missing, dtype=torch.bool, device=device)
+    else:
+        missing = missing.to(device=device, dtype=torch.bool)
+
+    if missing.dim() == 0:
+        missing = missing.unsqueeze(0).expand(batch_size)
+    else:
+        missing = missing.reshape(batch_size)
+
+    return ~missing
+
+
+def reduce_action_losses(losses: Tensor, action_dim_is_pad: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor]:
+    valid_mask = torch.ones_like(losses, dtype=torch.bool)
+    if action_dim_is_pad is not None:
+        if not isinstance(action_dim_is_pad, torch.Tensor):
+            action_dim_is_pad = torch.as_tensor(action_dim_is_pad, dtype=torch.bool, device=losses.device)
+        else:
+            action_dim_is_pad = action_dim_is_pad.to(device=losses.device, dtype=torch.bool)
+        if action_dim_is_pad.dim() == 1:
+            action_dim_is_pad = action_dim_is_pad.unsqueeze(0)
+        valid_mask &= ~action_dim_is_pad.unsqueeze(1)
+
+    masked_losses = losses * valid_mask.to(dtype=losses.dtype)
+    per_sample_denominator = valid_mask.sum(dim=(1, 2)).clamp_min(1).to(dtype=losses.dtype)
+    per_sample_loss = masked_losses.sum(dim=(1, 2)) / per_sample_denominator
+
+    per_dim_denominator = valid_mask.sum(dim=(0, 1)).clamp_min(1).to(dtype=losses.dtype)
+    loss_per_dim = masked_losses.sum(dim=(0, 1)) / per_dim_denominator
+
+    return per_sample_loss.mean(), per_sample_loss, loss_per_dim
+
+
 # Define the complete layer computation function for gradient checkpointing
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
@@ -1137,7 +1177,6 @@ class PI05Policy(PreTrainedPolicy):
         images = []
         img_masks = []
 
-        # Get device from model parameters
         device = next(self.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
@@ -1149,48 +1188,40 @@ class PI05Policy(PreTrainedPolicy):
                 f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
             )
 
-        # Preprocess image features present in the batch
+        padded_template = None
+        padded_mask = None
+
         for key in present_img_keys:
             img = batch[key]
-
-            # Ensure tensor is on the same device as the model
             if img.device != device:
                 img = img.to(device)
-
-            # Ensure float32 dtype for consistency
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
 
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
+            is_channels_first = img.shape[1] == 3
             if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
                 img = img.permute(0, 2, 3, 1)
 
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
             if img.shape[1:3] != self.config.image_resolution:
                 img = resize_with_pad_torch(img, *self.config.image_resolution)
 
-            # Normalize from [0,1] to [-1,1] as expected by siglip
             img = img * 2.0 - 1.0
 
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
             if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+                img = img.permute(0, 3, 1, 2)
 
             images.append(img)
-            # Create mask (all ones for real images)
             bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            img_masks.append(mask)
+            img_masks.append(get_image_valid_mask(batch, key, bsize, device))
+            padded_template = torch.ones_like(img) * -1
+            padded_mask = torch.zeros(bsize, dtype=torch.bool, device=device)
 
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
-            images.append(img)
-            img_masks.append(mask)
+        if padded_template is None or padded_mask is None:
+            raise ValueError("Unable to build image padding template for PI05")
+
+        for _missing_key in missing_img_keys:
+            images.append(padded_template.clone())
+            img_masks.append(padded_mask.clone())
 
         return images, img_masks
 
@@ -1256,18 +1287,17 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        action_dim_is_pad = batch.get(f"{ACTION}_dim_is_pad")
+        loss, per_sample_loss, loss_per_dim = reduce_action_losses(losses, action_dim_is_pad=action_dim_is_pad)
+
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
         }
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
+            loss_dict["loss"] = loss.item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

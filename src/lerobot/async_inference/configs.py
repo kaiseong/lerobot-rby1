@@ -23,6 +23,8 @@ from .constants import (
     DEFAULT_FPS,
     DEFAULT_INFERENCE_LATENCY,
     DEFAULT_OBS_QUEUE_TIMEOUT,
+    DEFAULT_ZMQ_TIMEOUT_MS,
+    SUPPORTED_BACKENDS,
 )
 
 # Aggregate function registry for CLI usage
@@ -107,16 +109,22 @@ class RobotClientConfig:
     including network connection, policy settings, and control behavior.
     """
 
-    # Policy configuration
-    policy_type: str = field(metadata={"help": "Type of policy to use"})
-    pretrained_name_or_path: str = field(metadata={"help": "Pretrained model name or path"})
-
     # Robot configuration (for CLI usage - robot instance will be created from this)
     robot: RobotConfig = field(metadata={"help": "Robot configuration"})
 
     # Policies typically output K actions at max, but we can use less to avoid wasting bandwidth (as actions
     # would be aggregated on the client side anyway, depending on the value of `chunk_size_threshold`)
     actions_per_chunk: int = field(metadata={"help": "Number of actions per chunk"})
+
+    # Remote inference backend configuration
+    backend: str = field(
+        default="grpc",
+        metadata={"help": f"Remote backend to use. Options: {SUPPORTED_BACKENDS}"},
+    )
+
+    # Policy configuration (required for grpc backend only)
+    policy_type: str = field(default="", metadata={"help": "Type of policy to use"})
+    pretrained_name_or_path: str = field(default="", metadata={"help": "Pretrained model name or path"})
 
     # Task instruction for the robot to execute (e.g., 'fold my tshirt')
     task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
@@ -142,6 +150,22 @@ class RobotClientConfig:
             "help": "Optional per-camera crop parameters as (top, left, height, width), applied on the client before sending observations"
         },
     )
+    zmq_timeout_ms: int = field(
+        default=DEFAULT_ZMQ_TIMEOUT_MS,
+        metadata={"help": "ZMQ send/recv timeout in milliseconds for the GR00T backend"},
+    )
+    groot_front_camera_key: str = field(
+        default="front",
+        metadata={"help": "Robot observation key mapped to GR00T cam_front_head"},
+    )
+    groot_right_wrist_camera_key: str = field(
+        default="right",
+        metadata={"help": "Robot observation key mapped to GR00T cam_right_wrist"},
+    )
+    groot_image_size: tuple[int, int] = field(
+        default=(480, 480),
+        metadata={"help": "Final (height, width) of GR00T camera observations after crop/resize"},
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -161,17 +185,21 @@ class RobotClientConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if self.backend not in SUPPORTED_BACKENDS:
+            raise ValueError(f"backend must be one of {SUPPORTED_BACKENDS}, got {self.backend!r}")
+
         if not self.server_address:
             raise ValueError("server_address cannot be empty")
 
-        if not self.policy_type:
-            raise ValueError("policy_type cannot be empty")
+        if self.backend == "grpc":
+            if not self.policy_type:
+                raise ValueError("policy_type cannot be empty when backend='grpc'")
 
-        if not self.pretrained_name_or_path:
-            raise ValueError("pretrained_name_or_path cannot be empty")
+            if not self.pretrained_name_or_path:
+                raise ValueError("pretrained_name_or_path cannot be empty when backend='grpc'")
 
-        if not self.policy_device:
-            raise ValueError("policy_device cannot be empty")
+            if not self.policy_device:
+                raise ValueError("policy_device cannot be empty when backend='grpc'")
 
         if not self.client_device:
             raise ValueError("client_device cannot be empty")
@@ -184,6 +212,25 @@ class RobotClientConfig:
 
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+
+        if self.zmq_timeout_ms <= 0:
+            raise ValueError(f"zmq_timeout_ms must be positive, got {self.zmq_timeout_ms}")
+
+        if not self.groot_front_camera_key:
+            raise ValueError("groot_front_camera_key cannot be empty")
+
+        if not self.groot_right_wrist_camera_key:
+            raise ValueError("groot_right_wrist_camera_key cannot be empty")
+
+        if len(self.groot_image_size) != 2:
+            raise ValueError(
+                f"groot_image_size must be a pair of integers (height, width), got {self.groot_image_size}"
+            )
+
+        groot_height, groot_width = (int(v) for v in self.groot_image_size)
+        if groot_height <= 0 or groot_width <= 0:
+            raise ValueError(f"groot_image_size dimensions must be positive, got {self.groot_image_size}")
+        self.groot_image_size = (groot_height, groot_width)
 
         normalized_crop_params = {}
         for key, value in self.image_crop_params.items():
@@ -215,6 +262,7 @@ class RobotClientConfig:
     def to_dict(self) -> dict:
         """Convert the configuration to a dictionary."""
         return {
+            "backend": self.backend,
             "server_address": self.server_address,
             "policy_type": self.policy_type,
             "pretrained_name_or_path": self.pretrained_name_or_path,
@@ -224,6 +272,10 @@ class RobotClientConfig:
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "image_crop_params": self.image_crop_params,
+            "zmq_timeout_ms": self.zmq_timeout_ms,
+            "groot_front_camera_key": self.groot_front_camera_key,
+            "groot_right_wrist_camera_key": self.groot_right_wrist_camera_key,
+            "groot_image_size": self.groot_image_size,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,

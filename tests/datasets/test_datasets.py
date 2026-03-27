@@ -16,6 +16,7 @@
 import logging
 import re
 from itertools import chain
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +27,7 @@ from PIL import Image
 from safetensors.torch import load_file
 
 import lerobot
-from lerobot.configs.default import DatasetConfig
+from lerobot.configs.default import DatasetConfig, DatasetCropConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.image_writer import image_array_to_pil_image
@@ -46,8 +47,10 @@ from lerobot.datasets.utils import (
 )
 from lerobot.datasets.video_utils import VALID_VIDEO_CODECS
 from lerobot.envs.factory import make_env_config
+from lerobot.policies.groot.processor_groot import GrootPackInputsStep
 from lerobot.policies.factory import make_policy_config
 from lerobot.robots import make_robot_from_config
+from lerobot.processor import TransitionKey
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STATE, OBS_STR, REWARD
 from tests.fixtures.constants import DUMMY_CHW, DUMMY_HWC, DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
@@ -1653,3 +1656,140 @@ def test_delta_timestamps_query_returns_correct_values(tmp_path, empty_lerobot_d
     # Previous frame is outside episode, so it's clamped to first frame and marked as padded
     assert state_values == [10.0, 10.0], f"Expected [10.0, 10.0], got {state_values}"
     assert is_pad == [True, False], f"Expected [True, False], got {is_pad}"
+
+
+@pytest.fixture
+def mismatched_camera_dataset(tmp_path, empty_lerobot_dataset_factory, img_array_factory):
+    features = {
+        ACTION: {"dtype": "float32", "shape": (2,), "names": None},
+        OBS_STATE: {"dtype": "float32", "shape": (4,), "names": None},
+        f"{OBS_IMAGES}.front": {"dtype": "image", "shape": (40, 60, 3), "names": ["height", "width", "channels"]},
+        f"{OBS_IMAGES}.right": {"dtype": "image", "shape": (80, 40, 3), "names": ["height", "width", "channels"]},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "mismatched_camera_dataset", features=features, fps=10)
+
+    for ep_idx in range(2):
+        for frame_idx in range(3):
+            frame = {
+                ACTION: np.full((2,), frame_idx, dtype=np.float32),
+                OBS_STATE: np.arange(4, dtype=np.float32) + ep_idx,
+                f"{OBS_IMAGES}.front": img_array_factory(height=40, width=60, dtype=np.uint8),
+                f"{OBS_IMAGES}.right": img_array_factory(height=80, width=40, dtype=np.uint8),
+                "task": f"task_{ep_idx}",
+            }
+            dataset.add_frame(frame)
+        dataset.save_episode()
+
+    dataset.finalize()
+    return dataset
+
+
+def _make_groot_transition(item):
+    return {
+        TransitionKey.OBSERVATION: {
+            f"{OBS_IMAGES}.front": item[f"{OBS_IMAGES}.front"].unsqueeze(0),
+            f"{OBS_IMAGES}.right": item[f"{OBS_IMAGES}.right"].unsqueeze(0),
+            OBS_STATE: item[OBS_STATE].unsqueeze(0),
+        },
+        TransitionKey.ACTION: None,
+        TransitionKey.REWARD: 0.0,
+        TransitionKey.DONE: False,
+        TransitionKey.TRUNCATED: False,
+        TransitionKey.INFO: {},
+        TransitionKey.COMPLEMENTARY_DATA: {"task": item["task"]},
+    }
+
+
+def test_make_dataset_without_crop_uses_source_root(mismatched_camera_dataset):
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id=DUMMY_REPO_ID, root=str(mismatched_camera_dataset.root)),
+        policy=make_policy_config("act"),
+    )
+
+    dataset = make_dataset(cfg)
+    item = dataset[0]
+
+    assert dataset.root == mismatched_camera_dataset.root
+    assert item[f"{OBS_IMAGES}.front"].shape == (3, 40, 60)
+    assert item[f"{OBS_IMAGES}.right"].shape == (3, 80, 40)
+
+
+def test_make_dataset_with_crop_creates_and_reuses_processed_dataset(mismatched_camera_dataset):
+    crop_cfg = DatasetCropConfig(
+        enable=True,
+        resize_size=(32, 32),
+        params={
+            f"{OBS_IMAGES}.front": (4, 8, 32, 32),
+            f"{OBS_IMAGES}.right": (16, 4, 32, 32),
+        },
+    )
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(mismatched_camera_dataset.root),
+            crop=crop_cfg,
+        ),
+        policy=make_policy_config("act"),
+    )
+
+    dataset = make_dataset(cfg)
+    item = dataset[0]
+
+    assert dataset.root != mismatched_camera_dataset.root
+    assert tuple(dataset.meta.features[f"{OBS_IMAGES}.front"]["shape"]) == (32, 32, 3)
+    assert tuple(dataset.meta.features[f"{OBS_IMAGES}.right"]["shape"]) == (32, 32, 3)
+    assert item[f"{OBS_IMAGES}.front"].shape == (3, 32, 32)
+    assert item[f"{OBS_IMAGES}.right"].shape == (3, 32, 32)
+    assert item["task"] == "task_0"
+    assert (dataset.root / "meta" / "crop_params.json").exists()
+
+    with patch("lerobot.datasets.factory.convert_lerobot_dataset_to_cropped_lerobot_dataset") as convert_mock:
+        reused_dataset = make_dataset(cfg)
+
+    convert_mock.assert_not_called()
+    assert reused_dataset.root == dataset.root
+
+
+def test_make_dataset_with_crop_requires_all_camera_params(mismatched_camera_dataset):
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(mismatched_camera_dataset.root),
+            crop=DatasetCropConfig(
+                enable=True,
+                resize_size=(32, 32),
+                params={f"{OBS_IMAGES}.front": (4, 8, 32, 32)},
+            ),
+        ),
+        policy=make_policy_config("act"),
+    )
+
+    with pytest.raises(ValueError, match="Missing crop params"):
+        make_dataset(cfg)
+
+
+def test_groot_pack_accepts_cropped_training_dataset(mismatched_camera_dataset):
+    pack_inputs = GrootPackInputsStep()
+    with pytest.raises(ValueError, match="all input arrays must have the same shape"):
+        pack_inputs(_make_groot_transition(mismatched_camera_dataset[0]))
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(mismatched_camera_dataset.root),
+            crop=DatasetCropConfig(
+                enable=True,
+                resize_size=(32, 32),
+                params={
+                    f"{OBS_IMAGES}.front": (4, 8, 32, 32),
+                    f"{OBS_IMAGES}.right": (16, 4, 32, 32),
+                },
+            ),
+        ),
+        policy=make_policy_config("groot"),
+    )
+
+    dataset = make_dataset(cfg)
+    result = pack_inputs(_make_groot_transition(dataset[0]))
+
+    assert result[TransitionKey.OBSERVATION]["video"].shape == (1, 1, 2, 3, 32, 32)

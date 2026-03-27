@@ -29,7 +29,10 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     remove_feature,
     split_dataset,
+    trim_episode_edges,
+    trim_stationary_episode_edges,
 )
+from lerobot.datasets.utils import load_episodes
 from lerobot.scripts.lerobot_edit_dataset import convert_image_to_video_dataset
 
 
@@ -61,6 +64,359 @@ def sample_dataset(tmp_path, empty_lerobot_dataset_factory):
     dataset.finalize()
     return dataset
 
+
+@pytest.fixture
+def sample_video_dataset(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (64, 64, 3),
+            "names": None,
+            "info": {
+                "video.height": 64,
+                "video.width": 64,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "video.fps": 10,
+                "video.channels": 3,
+                "has_audio": False,
+            },
+        },
+    }
+
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "test_video_dataset",
+        features=features,
+    )
+
+    for ep_idx in range(5):
+        for _ in range(10):
+            frame = {
+                "action": np.random.randn(6).astype(np.float32),
+                "observation.state": np.random.randn(4).astype(np.float32),
+                "observation.images.top": np.random.randint(0, 255, size=(64, 64, 3), dtype=np.uint8),
+                "task": f"task_{ep_idx % 2}",
+            }
+            dataset.add_frame(frame)
+        dataset.save_episode(parallel_encoding=False)
+
+    dataset.finalize()
+    return dataset
+
+
+
+
+def _make_stationary_episode_states(
+    start_stationary_frames: int,
+    motion_frames: int,
+    end_stationary_frames: int,
+    jitter: float = 1e-5,
+    dim: int = 4,
+) -> list[np.ndarray]:
+    start_base = np.zeros(dim, dtype=np.float32)
+    end_base = np.full(dim, 2.0, dtype=np.float32)
+    states = []
+
+    for idx in range(start_stationary_frames):
+        state = start_base.copy()
+        state[-1] += jitter if idx % 2 else 0.0
+        states.append(state)
+
+    for idx in range(motion_frames):
+        value = (idx + 1) / (motion_frames + 1)
+        states.append(np.full(dim, value, dtype=np.float32))
+
+    for idx in range(end_stationary_frames):
+        state = end_base.copy()
+        state[-1] += jitter if idx % 2 else 0.0
+        states.append(state)
+
+    return states
+
+
+
+def _create_video_dataset_with_states(
+    tmp_path,
+    empty_lerobot_dataset_factory,
+    episode_states: list[list[np.ndarray]],
+    fps: int = 10,
+):
+    features = {
+        "action": {"dtype": "float32", "shape": (6,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (4,), "names": None},
+        "observation.images.top": {
+            "dtype": "video",
+            "shape": (32, 32, 3),
+            "names": None,
+            "info": {
+                "video.height": 32,
+                "video.width": 32,
+                "video.codec": "h264",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "video.fps": fps,
+                "video.channels": 3,
+                "has_audio": False,
+            },
+        },
+    }
+
+    dataset_root = tmp_path / f"stationary_video_dataset_{len(list(tmp_path.glob('stationary_video_dataset_*')))}"
+    dataset = empty_lerobot_dataset_factory(
+        root=dataset_root,
+        features=features,
+        fps=fps,
+    )
+
+    for ep_idx, states in enumerate(episode_states):
+        for frame_idx, state in enumerate(states):
+            frame = {
+                "action": np.full(6, frame_idx + ep_idx * 100, dtype=np.float32),
+                "observation.state": np.asarray(state, dtype=np.float32),
+                "observation.images.top": np.full((32, 32, 3), (frame_idx + ep_idx * 30) % 255, dtype=np.uint8),
+                "task": f"task_{ep_idx % 2}",
+            }
+            dataset.add_frame(frame)
+        dataset.save_episode(parallel_encoding=False)
+
+    dataset.finalize()
+    return dataset
+
+
+def test_trim_episode_edges(sample_video_dataset, tmp_path):
+    output_dir = tmp_path / "trimmed_video_dataset"
+    trim_seconds = 1 / sample_video_dataset.meta.fps
+    trim_frames = round(trim_seconds * sample_video_dataset.meta.fps)
+
+    trimmed_dataset = trim_episode_edges(
+        sample_video_dataset,
+        trim_start_seconds=trim_seconds,
+        trim_end_seconds=trim_seconds,
+        output_dir=output_dir,
+        repo_id="test/trimmed_video_dataset",
+    )
+
+    assert trimmed_dataset.meta.total_episodes == sample_video_dataset.meta.total_episodes
+    assert trimmed_dataset.meta.total_frames == sample_video_dataset.meta.total_frames - (
+        sample_video_dataset.meta.total_episodes * trim_frames * 2
+    )
+    assert trimmed_dataset.meta.stats is not None
+    for video_key in sample_video_dataset.meta.video_keys:
+        assert video_key in trimmed_dataset.meta.stats
+
+    if trimmed_dataset.meta.episodes is None:
+        trimmed_dataset.meta.episodes = load_episodes(trimmed_dataset.meta.root)
+    if sample_video_dataset.meta.episodes is None:
+        sample_video_dataset.meta.episodes = load_episodes(sample_video_dataset.meta.root)
+
+    expected_length = sample_video_dataset.meta.episodes[0]["length"] - (trim_frames * 2)
+    for ep_idx in range(trimmed_dataset.meta.total_episodes):
+        ep_meta = trimmed_dataset.meta.episodes[ep_idx]
+        assert ep_meta["length"] == expected_length
+        for video_key in trimmed_dataset.meta.video_keys:
+            video_path = trimmed_dataset.root / trimmed_dataset.meta.get_video_file_path(ep_idx, video_key)
+            assert video_path.exists()
+
+    first_episode_indices = [
+        idx
+        for idx, episode_index in enumerate(trimmed_dataset.hf_dataset["episode_index"])
+        if int(episode_index) == 0
+    ]
+    first_episode_timestamps = [float(trimmed_dataset.hf_dataset["timestamp"][idx]) for idx in first_episode_indices]
+    first_episode_frame_indices = [int(trimmed_dataset.hf_dataset["frame_index"][idx]) for idx in first_episode_indices]
+
+    assert first_episode_frame_indices == list(range(expected_length))
+    assert first_episode_timestamps[0] == pytest.approx(0.0)
+    assert first_episode_timestamps[-1] == pytest.approx((expected_length - 1) / trimmed_dataset.meta.fps)
+
+    item = trimmed_dataset[0]
+    assert "action" in item
+    for video_key in trimmed_dataset.meta.video_keys:
+        assert video_key in item
+
+
+def test_trim_episode_edges_rejects_invalid_requests(sample_video_dataset, tmp_path):
+    with pytest.raises(ValueError, match="At least one trim duration"):
+        trim_episode_edges(
+            sample_video_dataset,
+            trim_start_seconds=0.0,
+            trim_end_seconds=0.0,
+            output_dir=tmp_path / "trim_invalid_zero",
+            repo_id="test/trim_invalid_zero",
+        )
+
+    with pytest.raises(ValueError, match="non-negative"):
+        trim_episode_edges(
+            sample_video_dataset,
+            trim_start_seconds=-0.1,
+            trim_end_seconds=0.0,
+            output_dir=tmp_path / "trim_invalid_negative",
+            repo_id="test/trim_invalid_negative",
+        )
+
+    if sample_video_dataset.meta.episodes is None:
+        sample_video_dataset.meta.episodes = load_episodes(sample_video_dataset.root)
+    too_long_trim = sample_video_dataset.meta.episodes[0]["length"] / sample_video_dataset.meta.fps
+    with pytest.raises(ValueError, match="Trim would remove all frames"):
+        trim_episode_edges(
+            sample_video_dataset,
+            trim_start_seconds=too_long_trim / 2,
+            trim_end_seconds=too_long_trim / 2,
+            output_dir=tmp_path / "trim_invalid_short",
+            repo_id="test/trim_invalid_short",
+        )
+
+
+
+
+def test_trim_stationary_episode_edges(tmp_path, empty_lerobot_dataset_factory):
+    fps = 10
+    episode_states = _make_stationary_episode_states(40, 10, 70)
+    dataset = _create_video_dataset_with_states(
+        tmp_path,
+        empty_lerobot_dataset_factory,
+        [episode_states, episode_states],
+        fps=fps,
+    )
+
+    trimmed_dataset = trim_stationary_episode_edges(
+        dataset,
+        keep_start_seconds=1.0,
+        keep_end_seconds=2.0,
+        output_dir=tmp_path / "stationary_trimmed",
+        repo_id="test/stationary_trimmed",
+    )
+
+    expected_start = 30
+    expected_end = 70
+    expected_length = expected_end - expected_start
+
+    assert trimmed_dataset.meta.total_episodes == 2
+    assert trimmed_dataset.meta.total_frames == expected_length * 2
+
+    ep0_indices = [
+        idx for idx, episode_index in enumerate(trimmed_dataset.hf_dataset["episode_index"]) if int(episode_index) == 0
+    ]
+    ep0_states = np.stack([np.asarray(trimmed_dataset.hf_dataset["observation.state"][idx]) for idx in ep0_indices])
+    ep0_actions = np.stack([np.asarray(trimmed_dataset.hf_dataset["action"][idx]) for idx in ep0_indices])
+    ep0_timestamps = [float(trimmed_dataset.hf_dataset["timestamp"][idx]) for idx in ep0_indices]
+    ep0_frame_indices = [int(trimmed_dataset.hf_dataset["frame_index"][idx]) for idx in ep0_indices]
+
+    np.testing.assert_allclose(ep0_states, np.stack(episode_states[expected_start:expected_end]))
+    np.testing.assert_allclose(ep0_actions[:, 0], np.arange(expected_start, expected_end, dtype=np.float32))
+    assert ep0_frame_indices == list(range(expected_length))
+    assert ep0_timestamps[0] == pytest.approx(0.0)
+    assert ep0_timestamps[-1] == pytest.approx((expected_length - 1) / fps)
+
+    item = trimmed_dataset[0]
+    assert "observation.images.top" in item
+
+
+
+def test_trim_stationary_episode_edges_keeps_short_plateaus(tmp_path, empty_lerobot_dataset_factory):
+    fps = 10
+    episode_states = _make_stationary_episode_states(5, 10, 3)
+    dataset = _create_video_dataset_with_states(tmp_path, empty_lerobot_dataset_factory, [episode_states], fps=fps)
+
+    trimmed_dataset = trim_stationary_episode_edges(
+        dataset,
+        keep_start_seconds=1.0,
+        keep_end_seconds=1.0,
+        output_dir=tmp_path / "stationary_short_plateaus",
+        repo_id="test/stationary_short_plateaus",
+    )
+
+    assert trimmed_dataset.meta.total_frames == len(episode_states)
+
+
+
+def test_trim_stationary_episode_edges_ignores_non_stationary_sides(tmp_path, empty_lerobot_dataset_factory):
+    fps = 10
+    episode_states = [np.full(4, idx * 0.1, dtype=np.float32) for idx in range(20)]
+    dataset = _create_video_dataset_with_states(tmp_path, empty_lerobot_dataset_factory, [episode_states], fps=fps)
+
+    trimmed_dataset = trim_stationary_episode_edges(
+        dataset,
+        keep_start_seconds=1.0,
+        keep_end_seconds=1.0,
+        output_dir=tmp_path / "stationary_none",
+        repo_id="test/stationary_none",
+    )
+
+    assert trimmed_dataset.meta.total_frames == len(episode_states)
+
+
+
+def test_trim_stationary_episode_edges_respects_state_epsilon(tmp_path, empty_lerobot_dataset_factory):
+    fps = 10
+    episode_states = _make_stationary_episode_states(12, 6, 12, jitter=2e-4)
+    dataset = _create_video_dataset_with_states(tmp_path, empty_lerobot_dataset_factory, [episode_states], fps=fps)
+
+    trimmed_dataset = trim_stationary_episode_edges(
+        dataset,
+        keep_start_seconds=0.5,
+        keep_end_seconds=0.5,
+        output_dir=tmp_path / "stationary_epsilon",
+        repo_id="test/stationary_epsilon",
+        state_epsilon=5e-4,
+    )
+
+    assert trimmed_dataset.meta.total_frames == 16
+
+
+
+def test_trim_stationary_episode_edges_rejects_invalid_requests(tmp_path, empty_lerobot_dataset_factory):
+    fps = 10
+    moving_episode = _make_stationary_episode_states(10, 6, 10)
+    dataset = _create_video_dataset_with_states(tmp_path, empty_lerobot_dataset_factory, [moving_episode], fps=fps)
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        trim_stationary_episode_edges(
+            dataset,
+            keep_start_seconds=-0.1,
+            keep_end_seconds=0.0,
+            output_dir=tmp_path / "stationary_invalid_negative",
+            repo_id="test/stationary_invalid_negative",
+        )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        trim_stationary_episode_edges(
+            dataset,
+            keep_start_seconds=0.0,
+            keep_end_seconds=0.0,
+            output_dir=tmp_path / "stationary_invalid_epsilon",
+            repo_id="test/stationary_invalid_epsilon",
+            state_epsilon=0.0,
+        )
+
+    with pytest.raises(ValueError, match="not found in dataset features"):
+        trim_stationary_episode_edges(
+            dataset,
+            keep_start_seconds=0.0,
+            keep_end_seconds=0.0,
+            output_dir=tmp_path / "stationary_invalid_state_key",
+            repo_id="test/stationary_invalid_state_key",
+            state_key="missing.state",
+        )
+
+    all_stationary_episode = [np.zeros(4, dtype=np.float32) for _ in range(30)]
+    all_stationary_dataset = _create_video_dataset_with_states(
+        tmp_path,
+        empty_lerobot_dataset_factory,
+        [all_stationary_episode],
+        fps=fps,
+    )
+    with pytest.raises(ValueError, match="overlapping keep ranges"):
+        trim_stationary_episode_edges(
+            all_stationary_dataset,
+            keep_start_seconds=0.5,
+            keep_end_seconds=0.5,
+            output_dir=tmp_path / "stationary_invalid_overlap",
+            repo_id="test/stationary_invalid_overlap",
+        )
 
 def test_delete_single_episode(sample_dataset, tmp_path):
     """Test deleting a single episode."""

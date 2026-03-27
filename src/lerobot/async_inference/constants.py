@@ -22,6 +22,10 @@ DEFAULT_INFERENCE_LATENCY = 1 / DEFAULT_FPS
 """Server side: Timeout for observation queue in seconds"""
 DEFAULT_OBS_QUEUE_TIMEOUT = 2
 
+DEFAULT_ZMQ_TIMEOUT_MS = 10_000
+
+SUPPORTED_BACKENDS = ["grpc", "groot_n16_zmq"]
+
 # All action chunking policies
 SUPPORTED_POLICIES = ["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
 

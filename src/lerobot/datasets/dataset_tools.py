@@ -18,6 +18,8 @@
 
 This module provides utilities for:
 - Deleting episodes from datasets
+- Trimming fixed-duration windows from episode boundaries
+- Trimming stationary windows from episode boundaries based on robot state
 - Splitting datasets into multiple smaller datasets
 - Adding/removing features from datasets
 - Merging datasets (wrapper around aggregate functionality)
@@ -44,6 +46,7 @@ from lerobot.datasets.utils import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
+    DEFAULT_FEATURES,
     DEFAULT_EPISODES_PATH,
     get_parquet_file_size_in_mb,
     load_episodes,
@@ -52,7 +55,7 @@ from lerobot.datasets.utils import (
     write_stats,
     write_tasks,
 )
-from lerobot.datasets.video_utils import encode_video_frames, get_video_info
+from lerobot.datasets.video_utils import decode_video_frames, encode_video_frames, get_video_info, resolve_vcodec
 from lerobot.utils.constants import HF_LEROBOT_HOME, OBS_IMAGE
 
 
@@ -76,6 +79,8 @@ def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> d
     episode_row = df[df["episode_index"] == episode_idx].iloc[0]
 
     return episode_row.to_dict()
+
+
 
 
 def delete_episodes(
@@ -140,6 +145,267 @@ def delete_episodes(
     logging.info(f"Created new dataset with {len(episodes_to_keep)} episodes")
     return new_dataset
 
+
+
+
+def _validate_video_trim_dataset(dataset: LeRobotDataset, operation_name: str) -> None:
+    if len(dataset.meta.video_keys) == 0:
+        raise ValueError(f"{operation_name} currently only supports video-backed datasets")
+    if len(dataset.meta.image_keys) > 0:
+        raise ValueError(f"{operation_name} does not support datasets with image features")
+
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.meta.root)
+    if dataset.meta.tasks is None:
+        raise ValueError(f"Dataset tasks metadata is required for {operation_name}")
+
+
+def _resolve_trim_output(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None,
+    repo_id: str | None,
+) -> tuple[str, Path]:
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_trimmed"
+    resolved_output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+    return repo_id, resolved_output_dir
+
+
+def _resolve_trim_vcodec(dataset: LeRobotDataset) -> str:
+    first_video_key = dataset.meta.video_keys[0]
+    source_vcodec = dataset.meta.features[first_video_key].get("info", {}).get("video.codec", "libsvtav1")
+    codec_aliases = {"av1": "libsvtav1", "h265": "hevc", "x265": "hevc", "x264": "h264"}
+    requested_vcodec = codec_aliases.get(str(source_vcodec).lower(), str(source_vcodec).lower())
+    try:
+        return resolve_vcodec(requested_vcodec)
+    except ValueError:
+        logging.warning(
+            "Unsupported source video codec '%s' in dataset metadata; falling back to 'libsvtav1'",
+            source_vcodec,
+        )
+        return "libsvtav1"
+
+
+def _create_trimmed_dataset(
+    dataset: LeRobotDataset,
+    output_dir: Path,
+    repo_id: str,
+) -> LeRobotDataset:
+    trimmed_dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=dataset.meta.features,
+        root=output_dir,
+        robot_type=dataset.meta.robot_type,
+        use_videos=True,
+        tolerance_s=dataset.tolerance_s,
+        video_backend=dataset.video_backend,
+        vcodec=_resolve_trim_vcodec(dataset),
+    )
+    trimmed_dataset.meta.update_chunk_settings(
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+    return trimmed_dataset
+
+
+def _rebuild_trimmed_dataset(
+    dataset: LeRobotDataset,
+    episode_ranges: dict[int, tuple[int, int]],
+    output_dir: Path,
+    repo_id: str,
+) -> LeRobotDataset:
+    trimmed_dataset = _create_trimmed_dataset(dataset, output_dir, repo_id)
+
+    feature_keys_to_copy = [
+        key
+        for key in dataset.meta.features
+        if key not in DEFAULT_FEATURES and key not in dataset.meta.video_keys
+    ]
+    task_lookup = {int(row.task_index): task for task, row in dataset.meta.tasks.iterrows()}
+
+    cached_data_path = None
+    cached_df: pd.DataFrame | None = None
+
+    for ep_idx in tqdm(range(dataset.meta.total_episodes), desc="Trimming episodes"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        data_path = dataset.root / dataset.meta.get_data_file_path(ep_idx)
+        if data_path != cached_data_path:
+            cached_df = pd.read_parquet(data_path)
+            cached_data_path = data_path
+
+        assert cached_df is not None
+        ep_df = cached_df[cached_df["episode_index"] == ep_idx].reset_index(drop=True)
+        start_idx, end_idx = episode_ranges[ep_idx]
+        kept_df = ep_df.iloc[start_idx:end_idx].reset_index(drop=True)
+
+        kept_timestamps = [float(ts) for ts in kept_df["timestamp"].tolist()]
+        decoded_video_frames = {}
+        for video_key in dataset.meta.video_keys:
+            source_video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, video_key)
+            from_timestamp = float(ep_meta[f"videos/{video_key}/from_timestamp"])
+            query_timestamps = [from_timestamp + ts for ts in kept_timestamps]
+            decoded_video_frames[video_key] = decode_video_frames(
+                source_video_path,
+                query_timestamps,
+                dataset.tolerance_s,
+                dataset.video_backend,
+            )
+
+        per_feature_values = {key: kept_df[key].tolist() for key in feature_keys_to_copy}
+        task_indices = kept_df["task_index"].tolist()
+
+        for frame_idx in range(len(kept_df)):
+            frame = {"task": task_lookup[int(task_indices[frame_idx])]} 
+            for key in feature_keys_to_copy:
+                frame[key] = per_feature_values[key][frame_idx]
+            for video_key in dataset.meta.video_keys:
+                frame[video_key] = decoded_video_frames[video_key][frame_idx].permute(1, 2, 0)
+            trimmed_dataset.add_frame(frame)
+
+        trimmed_dataset.save_episode()
+
+    trimmed_dataset.finalize()
+
+    return LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+        video_backend=dataset.video_backend,
+    )
+
+
+def _get_stationary_prefix_length(stationary_mask: np.ndarray) -> int:
+    non_stationary_indices = np.flatnonzero(~stationary_mask)
+    if non_stationary_indices.size == 0:
+        return int(len(stationary_mask))
+    return int(non_stationary_indices[0])
+
+
+def _load_state_array(ep_df: pd.DataFrame, state_key: str) -> np.ndarray:
+    try:
+        states = np.stack([np.asarray(state, dtype=np.float32) for state in ep_df[state_key].tolist()])
+    except Exception as exc:  # nosec B110
+        raise ValueError(f"State feature '{state_key}' could not be converted to a numeric array") from exc
+
+    if states.ndim == 1:
+        states = states[:, None]
+
+    return states
+
+
+def trim_episode_edges(
+    dataset: LeRobotDataset,
+    trim_start_seconds: float,
+    trim_end_seconds: float,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Trim a fixed duration from the start and end of each episode in a video dataset.
+
+    The trimmed dataset is rebuilt episode-by-episode so frame indices, timestamps, video
+    metadata, and statistics are all regenerated consistently.
+    """
+    _validate_video_trim_dataset(dataset, "trim_episode_edges")
+
+    if trim_start_seconds < 0 or trim_end_seconds < 0:
+        raise ValueError("trim_start_seconds and trim_end_seconds must be non-negative")
+    if trim_start_seconds == 0 and trim_end_seconds == 0:
+        raise ValueError("At least one trim duration must be greater than 0")
+
+    trim_start_frames = round(trim_start_seconds * dataset.meta.fps)
+    trim_end_frames = round(trim_end_seconds * dataset.meta.fps)
+    total_trim_frames = trim_start_frames + trim_end_frames
+    if total_trim_frames == 0:
+        raise ValueError("Trim durations are too small for this dataset fps and round to 0 frames")
+
+    invalid_episodes = [
+        ep_idx
+        for ep_idx, ep in enumerate(dataset.meta.episodes)
+        if int(ep["length"]) <= total_trim_frames
+    ]
+    if invalid_episodes:
+        raise ValueError(
+            "Trim would remove all frames from episodes: "
+            f"{invalid_episodes}. Total trim frames: {total_trim_frames}"
+        )
+
+    repo_id, output_dir = _resolve_trim_output(dataset, output_dir, repo_id)
+    episode_ranges = {
+        ep_idx: (trim_start_frames, int(ep["length"]) - trim_end_frames)
+        for ep_idx, ep in enumerate(dataset.meta.episodes)
+    }
+    return _rebuild_trimmed_dataset(dataset, episode_ranges, output_dir, repo_id)
+
+
+def trim_stationary_episode_edges(
+    dataset: LeRobotDataset,
+    keep_start_seconds: float,
+    keep_end_seconds: float,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    state_key: str = "observation.state",
+    state_epsilon: float = 5e-4,
+) -> LeRobotDataset:
+    """Trim stationary episode boundaries while preserving a motion-adjacent slice on each side."""
+    _validate_video_trim_dataset(dataset, "trim_stationary_episode_edges")
+
+    if keep_start_seconds < 0 or keep_end_seconds < 0:
+        raise ValueError("keep_start_seconds and keep_end_seconds must be non-negative")
+    if state_epsilon <= 0:
+        raise ValueError("state_epsilon must be positive")
+    if state_key not in dataset.meta.features:
+        raise ValueError(f"State feature '{state_key}' not found in dataset features")
+    if dataset.meta.features[state_key].get("dtype") in {"image", "video"}:
+        raise ValueError(f"State feature '{state_key}' must be numeric, not {dataset.meta.features[state_key]['dtype']}")
+
+    keep_start_frames = round(keep_start_seconds * dataset.meta.fps)
+    keep_end_frames = round(keep_end_seconds * dataset.meta.fps)
+    repo_id, output_dir = _resolve_trim_output(dataset, output_dir, repo_id)
+
+    episode_ranges: dict[int, tuple[int, int]] = {}
+    invalid_episodes: list[int] = []
+
+    cached_data_path = None
+    cached_df: pd.DataFrame | None = None
+
+    for ep_idx in range(dataset.meta.total_episodes):
+        data_path = dataset.root / dataset.meta.get_data_file_path(ep_idx)
+        if data_path != cached_data_path:
+            cached_df = pd.read_parquet(data_path)
+            cached_data_path = data_path
+
+        assert cached_df is not None
+        ep_df = cached_df[cached_df["episode_index"] == ep_idx].reset_index(drop=True)
+        if state_key not in ep_df:
+            raise ValueError(f"State feature '{state_key}' not found in episode data")
+
+        state_array = _load_state_array(ep_df, state_key)
+        start_diffs = np.max(np.abs(state_array - state_array[0]), axis=1)
+        end_diffs = np.max(np.abs(state_array - state_array[-1]), axis=1)
+
+        start_stationary_len = _get_stationary_prefix_length(start_diffs <= state_epsilon)
+        end_stationary_len = _get_stationary_prefix_length((end_diffs <= state_epsilon)[::-1])
+
+        start_idx = max(0, start_stationary_len - keep_start_frames)
+        end_idx = len(ep_df) - max(0, end_stationary_len - keep_end_frames)
+
+        if start_idx >= end_idx:
+            invalid_episodes.append(ep_idx)
+            continue
+
+        episode_ranges[ep_idx] = (start_idx, end_idx)
+
+    if invalid_episodes:
+        raise ValueError(
+            "Stationary trim would remove all frames or produce overlapping keep ranges for episodes: "
+            f"{invalid_episodes}"
+        )
+
+    return _rebuild_trimmed_dataset(dataset, episode_ranges, output_dir, repo_id)
 
 def split_dataset(
     dataset: LeRobotDataset,

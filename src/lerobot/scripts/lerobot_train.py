@@ -339,7 +339,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
+    custom_sampler = dataset.make_sampler() if hasattr(dataset, "make_sampler") else None
     if hasattr(cfg.policy, "drop_n_last_frames"):
+        if custom_sampler is not None:
+            raise NotImplementedError("Mixed dataset sampling does not support drop_n_last_frames policies yet.")
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
@@ -348,6 +351,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
         )
+    elif custom_sampler is not None:
+        shuffle = False
+        sampler = custom_sampler
     else:
         shuffle = True
         sampler = None

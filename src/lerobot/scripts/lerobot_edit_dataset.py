@@ -17,7 +17,7 @@
 """
 Edit LeRobot datasets using various transformation tools.
 
-This script allows you to delete episodes, split datasets, merge datasets,
+This script allows you to delete episodes, trim episode boundaries, split datasets, merge datasets,
 remove features, modify tasks, and convert image datasets to video format.
 When new_repo_id is specified, creates a new dataset.
 
@@ -104,6 +104,26 @@ Convert image dataset to video format and push to hub:
         --operation.type convert_image_to_video \
         --push_to_hub true
 
+Trim 2 seconds from the start and end of every episode:
+    lerobot-edit-dataset \
+        --repo_id kaiseong/bin_0318_19_merged_crop480 \
+        --new_repo_id kaiseong/bin_0318_19_merged_crop480_trim2s \
+        --operation.type trim_episode_edges \
+        --operation.trim_start_seconds 2.0 \
+        --operation.trim_end_seconds 2.0 \
+        --push_to_hub true
+
+Trim stationary start/end plateaus while keeping only the motion-adjacent slice:
+    lerobot-edit-dataset \
+        --repo_id kaiseong/bin_0318_19_merged_crop480 \
+        --new_repo_id rainbowrobotics/bin_0318_19_merged_v3 \
+        --operation.type trim_stationary_episode_edges \
+        --operation.keep_start_seconds 1.0 \
+        --operation.keep_end_seconds 2.0 \
+        --operation.state_key observation.state \
+        --operation.state_epsilon 5e-4 \
+        --push_to_hub true
+
 Show dataset information:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht_image \
@@ -138,6 +158,8 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     remove_feature,
     split_dataset,
+    trim_episode_edges,
+    trim_stationary_episode_edges,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -161,6 +183,22 @@ class DeleteEpisodesConfig(OperationConfig):
 @dataclass
 class SplitConfig(OperationConfig):
     splits: dict[str, float | list[int]] | None = None
+
+
+@OperationConfig.register_subclass("trim_episode_edges")
+@dataclass
+class TrimEpisodeEdgesConfig(OperationConfig):
+    trim_start_seconds: float = 0.0
+    trim_end_seconds: float = 0.0
+
+
+@OperationConfig.register_subclass("trim_stationary_episode_edges")
+@dataclass
+class TrimStationaryEpisodeEdgesConfig(OperationConfig):
+    keep_start_seconds: float = 0.0
+    keep_end_seconds: float = 0.0
+    state_key: str = "observation.state"
+    state_epsilon: float = 5e-4
 
 
 @OperationConfig.register_subclass("merge")
@@ -261,6 +299,75 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_trim_episode_edges(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, TrimEpisodeEdgesConfig):
+        raise ValueError("Operation config must be TrimEpisodeEdgesConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(
+        f"Trimming {cfg.repo_id}: start={cfg.operation.trim_start_seconds}s, "
+        f"end={cfg.operation.trim_end_seconds}s"
+    )
+    new_dataset = trim_episode_edges(
+        dataset,
+        trim_start_seconds=cfg.operation.trim_start_seconds,
+        trim_end_seconds=cfg.operation.trim_end_seconds,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_trim_stationary_episode_edges(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, TrimStationaryEpisodeEdgesConfig):
+        raise ValueError("Operation config must be TrimStationaryEpisodeEdgesConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(
+        f"Stationary trimming {cfg.repo_id}: keep_start={cfg.operation.keep_start_seconds}s, "
+        f"keep_end={cfg.operation.keep_end_seconds}s, state_key={cfg.operation.state_key}, "
+        f"state_epsilon={cfg.operation.state_epsilon}"
+    )
+    new_dataset = trim_stationary_episode_edges(
+        dataset,
+        keep_start_seconds=cfg.operation.keep_start_seconds,
+        keep_end_seconds=cfg.operation.keep_end_seconds,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        state_key=cfg.operation.state_key,
+        state_epsilon=cfg.operation.state_epsilon,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
 
 
 def handle_split(cfg: EditDatasetConfig) -> None:
@@ -505,6 +612,10 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
 
     if operation_type == "delete_episodes":
         handle_delete_episodes(cfg)
+    elif operation_type == "trim_episode_edges":
+        handle_trim_episode_edges(cfg)
+    elif operation_type == "trim_stationary_episode_edges":
+        handle_trim_stationary_episode_edges(cfg)
     elif operation_type == "split":
         handle_split(cfg)
     elif operation_type == "merge":
