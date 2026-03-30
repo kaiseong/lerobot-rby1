@@ -16,6 +16,7 @@
 import hashlib
 import json
 import logging
+import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,11 +197,82 @@ def _resolve_dataset_location(dataset_cfg: DatasetConfig) -> _ResolvedDatasetLoc
     return processed_location
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | HeterogeneousLeRobotDataset:
-    """Handles the logic of setting up delta timestamps and image transforms before creating a dataset."""
-    image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+def _build_image_transforms(dataset_cfg: DatasetConfig) -> ImageTransforms | None:
+    return ImageTransforms(dataset_cfg.image_transforms) if dataset_cfg.image_transforms.enable else None
+
+
+def _apply_imagenet_stats(dataset: LeRobotDataset | HeterogeneousLeRobotDataset) -> None:
+    for key in dataset.meta.camera_keys:
+        for stats_type, stats in IMAGENET_STATS.items():
+            dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+
+def _make_single_dataset(
+    cfg: TrainPipelineConfig,
+    dataset_location: _ResolvedDatasetLocation,
+    episodes: list[int] | None,
+    image_transforms: ImageTransforms | None,
+) -> LeRobotDataset | StreamingLeRobotDataset:
+    ds_meta = LeRobotDatasetMetadata(
+        dataset_location.repo_id,
+        root=dataset_location.root,
+        revision=dataset_location.revision,
     )
+    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+
+    if not cfg.dataset.streaming:
+        return LeRobotDataset(
+            dataset_location.repo_id,
+            root=dataset_location.root,
+            episodes=episodes,
+            delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
+            revision=dataset_location.revision,
+            video_backend=cfg.dataset.video_backend,
+            tolerance_s=cfg.tolerance_s,
+        )
+
+    return StreamingLeRobotDataset(
+        dataset_location.repo_id,
+        root=dataset_location.root,
+        episodes=episodes,
+        delta_timestamps=delta_timestamps,
+        image_transforms=image_transforms,
+        revision=dataset_location.revision,
+        max_num_shards=cfg.num_workers,
+        tolerance_s=cfg.tolerance_s,
+    )
+
+
+def _split_episode_indices(
+    selected_episodes: list[int],
+    *,
+    val_ratio: float,
+    seed: int | None,
+) -> tuple[list[int], list[int]]:
+    shuffled = list(selected_episodes)
+    random.Random(0 if seed is None else seed).shuffle(shuffled)
+
+    val_count = int(len(shuffled) * val_ratio)
+    if val_count <= 0:
+        raise ValueError(
+            f"dataset.val_ratio={val_ratio} yields 0 validation episodes for {len(shuffled)} selected episodes"
+        )
+    if val_count >= len(shuffled):
+        raise ValueError(
+            f"dataset.val_ratio={val_ratio} leaves no training episodes for {len(shuffled)} selected episodes"
+        )
+
+    val_episodes = sorted(shuffled[:val_count])
+    train_episodes = sorted(shuffled[val_count:])
+    return train_episodes, val_episodes
+
+
+def make_train_val_datasets(
+    cfg: TrainPipelineConfig,
+) -> tuple[LeRobotDataset | HeterogeneousLeRobotDataset, LeRobotDataset | None]:
+    """Create the training dataset and an optional validation dataset."""
+    train_image_transforms = _build_image_transforms(cfg.dataset)
 
     if cfg.dataset.sources:
         source_datasets = []
@@ -216,52 +288,66 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | HeterogeneousLeRo
                 root=source_cfg.root,
                 episodes=source_cfg.episodes,
                 delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
+                image_transforms=train_image_transforms,
                 revision=source_cfg.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
             )
             source_datasets.append((source_cfg, dataset, source_meta))
 
-        dataset = build_rby1_mixed_dataset(
+        train_dataset = build_rby1_mixed_dataset(
             source_datasets,
             mixing_strategy=cfg.dataset.mixing_strategy,
         )
+        val_dataset = None
     else:
         dataset_location = _resolve_dataset_location(cfg.dataset)
-        ds_meta = LeRobotDatasetMetadata(
-            dataset_location.repo_id,
-            root=dataset_location.root,
-            revision=dataset_location.revision,
-        )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-        if not cfg.dataset.streaming:
-            dataset = LeRobotDataset(
+        if cfg.dataset.val_ratio > 0:
+            ds_meta = LeRobotDatasetMetadata(
                 dataset_location.repo_id,
                 root=dataset_location.root,
-                episodes=cfg.dataset.episodes,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
                 revision=dataset_location.revision,
-                video_backend=cfg.dataset.video_backend,
-                tolerance_s=cfg.tolerance_s,
+            )
+            selected_episodes = (
+                list(cfg.dataset.episodes)
+                if cfg.dataset.episodes is not None
+                else list(range(ds_meta.total_episodes))
+            )
+            train_episodes, val_episodes = _split_episode_indices(
+                selected_episodes,
+                val_ratio=cfg.dataset.val_ratio,
+                seed=cfg.seed,
+            )
+            train_dataset = _make_single_dataset(
+                cfg,
+                dataset_location=dataset_location,
+                episodes=train_episodes,
+                image_transforms=train_image_transforms,
+            )
+            val_dataset = _make_single_dataset(
+                cfg,
+                dataset_location=dataset_location,
+                episodes=val_episodes,
+                image_transforms=None,
             )
         else:
-            dataset = StreamingLeRobotDataset(
-                dataset_location.repo_id,
-                root=dataset_location.root,
+            train_dataset = _make_single_dataset(
+                cfg,
+                dataset_location=dataset_location,
                 episodes=cfg.dataset.episodes,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                revision=dataset_location.revision,
-                max_num_shards=cfg.num_workers,
-                tolerance_s=cfg.tolerance_s,
+                image_transforms=train_image_transforms,
             )
-
+            val_dataset = None
 
     if cfg.dataset.use_imagenet_stats:
-        for key in dataset.meta.camera_keys:
-            for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        _apply_imagenet_stats(train_dataset)
+        if val_dataset is not None:
+            _apply_imagenet_stats(val_dataset)
 
+    return train_dataset, val_dataset
+
+
+def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | HeterogeneousLeRobotDataset:
+    """Backward-compatible helper that returns only the training dataset."""
+    dataset, _ = make_train_val_datasets(cfg)
     return dataset

@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.factory import make_train_val_datasets
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -150,6 +150,92 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _iterate_batch_tensors(batch: Any):
+    if isinstance(batch, torch.Tensor):
+        yield batch
+    elif isinstance(batch, dict):
+        for value in batch.values():
+            yield from _iterate_batch_tensors(value)
+    elif isinstance(batch, (list, tuple)):
+        for value in batch:
+            yield from _iterate_batch_tensors(value)
+
+
+def _infer_batch_size(batch: Any) -> int:
+    for tensor in _iterate_batch_tensors(batch):
+        if tensor.ndim > 0:
+            return int(tensor.shape[0])
+    return 1
+
+
+def _extract_scalar_metrics(output_dict: dict[str, Any]) -> dict[str, float]:
+    scalar_metrics = {}
+    for key, value in output_dict.items():
+        if isinstance(value, (int, float)):
+            scalar_metrics[key] = float(value)
+        elif isinstance(value, torch.Tensor) and value.numel() == 1:
+            scalar_metrics[key] = float(value.detach().item())
+    return scalar_metrics
+
+
+def run_validation(
+    policy: PreTrainedPolicy,
+    dataloader,
+    preprocessor,
+    accelerator: Accelerator,
+) -> dict[str, float]:
+    was_training = policy.training
+    policy.eval()
+    accelerator.wait_for_everyone()
+
+    total_loss = torch.zeros((), device=accelerator.device, dtype=torch.float64)
+    total_weight = torch.zeros((), device=accelerator.device, dtype=torch.float64)
+    metric_sums: dict[str, torch.Tensor] = {}
+    start_time = time.perf_counter()
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = preprocessor(batch)
+            batch_size = _infer_batch_size(batch)
+            batch_weight = torch.tensor(float(batch_size), device=accelerator.device, dtype=torch.float64)
+
+            with accelerator.autocast():
+                loss, output_dict = policy.forward(batch)
+
+            total_loss += loss.detach().to(torch.float64) * batch_weight
+            total_weight += batch_weight
+
+            for key, value in _extract_scalar_metrics(output_dict).items():
+                if key == "loss":
+                    continue
+                if key not in metric_sums:
+                    metric_sums[key] = torch.zeros((), device=accelerator.device, dtype=torch.float64)
+                metric_sums[key] += torch.tensor(value, device=accelerator.device, dtype=torch.float64) * batch_weight
+
+    total_loss = accelerator.reduce(total_loss, reduction="sum")
+    total_weight = accelerator.reduce(total_weight, reduction="sum")
+
+    if total_weight.item() == 0:
+        results = {"val/loss": float("nan"), "val/num_samples": 0.0}
+    else:
+        results = {
+            "val/loss": (total_loss / total_weight).item(),
+            "val/num_samples": total_weight.item(),
+        }
+        for key, value in metric_sums.items():
+            reduced_value = accelerator.reduce(value, reduction="sum")
+            results[f"val/{key}"] = (reduced_value / total_weight).item()
+
+    accelerator.wait_for_everyone()
+    if was_training:
+        policy.train()
+
+    if accelerator.is_main_process:
+        results["val/eval_s"] = time.perf_counter() - start_time
+
+    return results
+
+
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -215,13 +301,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+        dataset, val_dataset = make_train_val_datasets(cfg)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        dataset, val_dataset = make_train_val_datasets(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -332,6 +418,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
+        if val_dataset is not None:
+            logging.info(f"{val_dataset.num_frames=} ({format_big_number(val_dataset.num_frames)})")
+            logging.info(f"{val_dataset.num_episodes=}")
         num_processes = accelerator.num_processes
         effective_bs = cfg.batch_size * num_processes
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
@@ -369,11 +458,40 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    val_dataloader = None
+    if val_dataset is not None:
+        if hasattr(cfg.policy, "drop_n_last_frames"):
+            val_sampler = EpisodeAwareSampler(
+                val_dataset.meta.episodes["dataset_from_index"],
+                val_dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=val_dataset.episodes,
+                drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                shuffle=False,
+            )
+        else:
+            val_sampler = None
+
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if val_dataloader is None:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
+    else:
+        policy, optimizer, dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, val_dataloader, lr_scheduler
+        )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -436,6 +554,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_val_step = (
+            val_dataloader is not None and cfg.val_freq > 0 and (step % cfg.val_freq == 0 or step == cfg.steps)
+        )
 
         if is_log_step:
             logging.info(train_tracker)
@@ -475,6 +596,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+
+        if is_val_step:
+            val_metrics = run_validation(
+                policy=policy,
+                dataloader=val_dataloader,
+                preprocessor=preprocessor,
+                accelerator=accelerator,
+            )
+            if is_main_process:
+                formatted_metrics = " ".join(
+                    f"{key}:{value:.3f}" for key, value in val_metrics.items() if key != "val/num_samples"
+                )
+                logging.info(f"Validation step:{format_big_number(step)} {formatted_metrics}")
+                if wandb_logger:
+                    wandb_logger.log_dict(val_metrics, step)
 
         if cfg.env and is_eval_step:
             if is_main_process:

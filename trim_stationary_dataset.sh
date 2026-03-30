@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-REPO_ID="rainbowrobotics/bin_0318-20_merged"
-NEW_REPO_ID="rainbowrobotics/bin_0318-20_merged_trim_0.2"
+REPO_ID="rainbowrobotics/bin_0318_19_merged"
+NEW_REPO_ID="kaiseong/bin_0318-19_merged_trim_0.2"
 PUSH_TO_HUB="true"
 KEEP_START_SECONDS="0.2"
 KEEP_END_SECONDS="0.2"

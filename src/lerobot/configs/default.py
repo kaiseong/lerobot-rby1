@@ -85,6 +85,7 @@ class DatasetConfig:
     sources: list[DatasetSourceConfig] = field(default_factory=list)
     mixing_strategy: str = "uniform"
     crop: DatasetCropConfig = field(default_factory=DatasetCropConfig)
+    val_ratio: float = 0.0
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
@@ -92,6 +93,10 @@ class DatasetConfig:
     streaming: bool = False
 
     def __post_init__(self) -> None:
+        self.val_ratio = float(self.val_ratio)
+        if not 0.0 <= self.val_ratio < 1.0:
+            raise ValueError(f"dataset.val_ratio must be in [0.0, 1.0), got {self.val_ratio}")
+
         if self.mixing_strategy not in {"uniform", "manual"}:
             raise ValueError(
                 f"dataset.mixing_strategy must be one of ['uniform', 'manual'], got {self.mixing_strategy}"
@@ -110,12 +115,16 @@ class DatasetConfig:
                 raise ValueError("dataset.crop is not supported together with dataset.sources")
             if self.streaming:
                 raise ValueError("dataset.streaming is not supported together with dataset.sources")
+            if self.val_ratio > 0:
+                raise ValueError("dataset.val_ratio is not supported together with dataset.sources")
             if self.mixing_strategy == "manual":
                 for source in self.sources:
                     if source.weight <= 0:
                         raise ValueError(
                             f"dataset.sources[{source.repo_id}].weight must be positive when using manual mixing"
                         )
+        elif self.val_ratio > 0 and self.streaming:
+            raise ValueError("dataset.val_ratio is not supported together with dataset.streaming")
         elif not self.repo_id:
             raise ValueError("Either dataset.repo_id or dataset.sources must be provided")
 

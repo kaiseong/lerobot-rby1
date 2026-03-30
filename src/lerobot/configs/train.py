@@ -56,6 +56,7 @@ class TrainPipelineConfig(HubMixin):
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
+    val_freq: int | None = None
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
@@ -115,6 +116,16 @@ class TrainPipelineConfig(HubMixin):
                 self.job_name = f"{self.policy.type}"
             else:
                 self.job_name = f"{self.env.type}_{self.policy.type}"
+
+        if self.val_freq is None:
+            self.val_freq = self.save_freq
+        else:
+            self.val_freq = int(self.val_freq)
+
+        if self.dataset.val_ratio > 0 and self.val_freq <= 0:
+            raise ValueError(
+                f"val_freq must be positive when dataset.val_ratio > 0, got {self.val_freq}"
+            )
 
         if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
             raise FileExistsError(

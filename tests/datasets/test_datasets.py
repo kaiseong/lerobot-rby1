@@ -27,9 +27,9 @@ from PIL import Image
 from safetensors.torch import load_file
 
 import lerobot
-from lerobot.configs.default import DatasetConfig, DatasetCropConfig
+from lerobot.configs.default import DatasetConfig, DatasetCropConfig, DatasetSourceConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.factory import make_dataset, make_train_val_datasets
 from lerobot.datasets.image_writer import image_array_to_pil_image
 from lerobot.datasets.lerobot_dataset import (
     LeRobotDataset,
@@ -1793,3 +1793,82 @@ def test_groot_pack_accepts_cropped_training_dataset(mismatched_camera_dataset):
     result = pack_inputs(_make_groot_transition(dataset[0]))
 
     assert result[TransitionKey.OBSERVATION]["video"].shape == (1, 1, 2, 3, 32, 32)
+
+
+def test_make_train_val_datasets_splits_selected_episodes_deterministically(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        ACTION: {"dtype": "float32", "shape": (2,), "names": None},
+        OBS_STATE: {"dtype": "float32", "shape": (4,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "val_split_dataset", features=features, fps=10)
+
+    for ep_idx in range(4):
+        for frame_idx in range(3):
+            dataset.add_frame(
+                {
+                    ACTION: np.full((2,), frame_idx, dtype=np.float32),
+                    OBS_STATE: np.arange(4, dtype=np.float32) + ep_idx,
+                    "task": f"task_{ep_idx}",
+                }
+            )
+        dataset.save_episode()
+    dataset.finalize()
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(dataset.root),
+            episodes=[0, 1, 2, 3],
+            val_ratio=0.25,
+        ),
+        policy=make_policy_config("act"),
+        seed=123,
+    )
+
+    train_dataset, val_dataset = make_train_val_datasets(cfg)
+    second_train_dataset, second_val_dataset = make_train_val_datasets(cfg)
+
+    assert val_dataset is not None
+    assert train_dataset.episodes == second_train_dataset.episodes
+    assert val_dataset.episodes == second_val_dataset.episodes
+    assert len(train_dataset.episodes) == 3
+    assert len(val_dataset.episodes) == 1
+    assert set(train_dataset.episodes).isdisjoint(set(val_dataset.episodes))
+    assert set(train_dataset.episodes) | set(val_dataset.episodes) == {0, 1, 2, 3}
+
+
+def test_make_train_val_datasets_with_crop_reuses_processed_root(mismatched_camera_dataset):
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(mismatched_camera_dataset.root),
+            val_ratio=0.5,
+            crop=DatasetCropConfig(
+                enable=True,
+                resize_size=(32, 32),
+                params={
+                    f"{OBS_IMAGES}.front": (4, 8, 32, 32),
+                    f"{OBS_IMAGES}.right": (16, 4, 32, 32),
+                },
+            ),
+        ),
+        policy=make_policy_config("act"),
+        seed=321,
+    )
+
+    train_dataset, val_dataset = make_train_val_datasets(cfg)
+
+    assert val_dataset is not None
+    assert train_dataset.root == val_dataset.root
+    assert train_dataset.root != mismatched_camera_dataset.root
+    assert set(train_dataset.episodes).isdisjoint(set(val_dataset.episodes))
+
+
+def test_dataset_config_rejects_validation_with_sources():
+    with pytest.raises(ValueError, match="dataset.val_ratio is not supported together with dataset.sources"):
+        DatasetConfig(
+            sources=[
+                DatasetSourceConfig(repo_id="dummy/source", adapter="rby1_right_arm_legacy")
+            ],
+            val_ratio=0.1,
+        )
