@@ -33,7 +33,7 @@ class Rby1Config(RobotConfig):
     "right": RealSenseCameraConfig(serial_number_or_name="335122272086", fps=15, width=480, height=640, rotation=Cv2Rotation.ROTATE_90), #right
     # "front": OpenCVCameraConfig(index_or_path=2, fps=15, width=848, height=480),
     # "right": OpenCVCameraConfig(index_or_path=10, fps=15, width=480, height=848, rotation=Cv2Rotation.ROTATE_90),
-    "left": RealSenseCameraConfig(serial_number_or_name="230422270977", fps=15, width=480, height=640, rotation=Cv2Rotation.ROTATE_90), #left
+    # "left": RealSenseCameraConfig(serial_number_or_name="230422270977", fps=15, width=480, height=640, rotation=Cv2Rotation.ROTATE_90), #left
     })
 
     # Passive (observe-only) mode: connect to the robot for state reading but
@@ -48,7 +48,7 @@ class Rby1Config(RobotConfig):
     # Disabled groups are held at their current position during send_action().
     use_torso: bool = False
     use_right_arm: bool = True
-    use_left_arm: bool = True
+    use_left_arm: bool = False
 
     # ── Impedance control ──────────────────────────────────────────────
     # When True, send_action uses JointImpedanceControlCommandBuilder
