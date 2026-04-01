@@ -18,20 +18,27 @@ import json
 import logging
 import random
 import shutil
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
 
 from lerobot.configs.default import DatasetConfig
-from lerobot.datasets.mixed_dataset import HeterogeneousLeRobotDataset, build_rby1_mixed_dataset
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.mixed_dataset import HeterogeneousLeRobotDataset, build_rby1_mixed_dataset
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
-from lerobot.datasets.utils import load_info
-from lerobot.rl.crop_dataset_roi import convert_lerobot_dataset_to_cropped_lerobot_dataset
+from lerobot.datasets.utils import DEFAULT_EPISODES_PATH, load_info, unflatten_dict
+from lerobot.rl.crop_dataset_roi import (
+    convert_lerobot_dataset_to_cropped_lerobot_dataset,
+    convert_lerobot_dataset_to_resized_padded_lerobot_dataset,
+)
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_PREFIX, REWARD
 
 IMAGENET_STATS = {
@@ -96,11 +103,30 @@ def _get_crop_cache_key(dataset_cfg: DatasetConfig) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _get_resize_pad_cache_key(dataset_cfg: DatasetConfig) -> str:
+    payload = {
+        "repo_id": dataset_cfg.repo_id,
+        "revision": dataset_cfg.revision,
+        "source_root": str(Path(dataset_cfg.root).resolve()) if dataset_cfg.root else None,
+        "resize_size": list(dataset_cfg.resize_pad.resize_size),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
 def _get_processed_dataset_location(dataset_cfg: DatasetConfig) -> _ResolvedDatasetLocation:
     safe_repo_id = dataset_cfg.repo_id.replace("/", "__")
     cache_key = _get_crop_cache_key(dataset_cfg)
     root = HF_LEROBOT_HOME / "_training_preprocessed" / safe_repo_id / cache_key
     repo_id = f"local/{safe_repo_id}__train_crop__{cache_key}"
+    return _ResolvedDatasetLocation(repo_id=repo_id, root=str(root), revision=None)
+
+
+def _get_resize_padded_dataset_location(dataset_cfg: DatasetConfig) -> _ResolvedDatasetLocation:
+    safe_repo_id = dataset_cfg.repo_id.replace("/", "__")
+    cache_key = _get_resize_pad_cache_key(dataset_cfg)
+    root = HF_LEROBOT_HOME / "_training_preprocessed" / safe_repo_id / cache_key
+    repo_id = f"local/{safe_repo_id}__train_resize_pad__{cache_key}"
     return _ResolvedDatasetLocation(repo_id=repo_id, root=str(root), revision=None)
 
 
@@ -144,35 +170,75 @@ def _write_crop_metadata(dataset_root: Path, dataset_cfg: DatasetConfig) -> None
     (meta_dir / "crop_params.json").write_text(json.dumps(crop_metadata, indent=2, sort_keys=True))
 
 
+def _write_resize_pad_metadata(dataset_root: Path, dataset_cfg: DatasetConfig) -> None:
+    meta_dir = dataset_root / "meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    resize_pad_metadata = {
+        "source_repo_id": dataset_cfg.repo_id,
+        "source_revision": dataset_cfg.revision,
+        "source_root": dataset_cfg.root,
+        "resize_size": list(dataset_cfg.resize_pad.resize_size),
+    }
+    (meta_dir / "resize_pad_params.json").write_text(json.dumps(resize_pad_metadata, indent=2, sort_keys=True))
+
+
 def _resolve_dataset_location(dataset_cfg: DatasetConfig) -> _ResolvedDatasetLocation:
-    if not dataset_cfg.crop.enable:
+    if not dataset_cfg.crop.enable and not dataset_cfg.resize_pad.enable:
         return _ResolvedDatasetLocation(
             repo_id=dataset_cfg.repo_id,
             root=dataset_cfg.root,
             revision=dataset_cfg.revision,
         )
 
-    if not dataset_cfg.crop.params:
-        raise ValueError("dataset.crop.enable is true but dataset.crop.params is empty")
-
     source_dataset = LeRobotDataset(
         dataset_cfg.repo_id,
         root=dataset_cfg.root,
         revision=dataset_cfg.revision,
     )
-    camera_keys = set(source_dataset.meta.camera_keys)
-    crop_keys = set(dataset_cfg.crop.params)
-    missing_keys = sorted(camera_keys - crop_keys)
-    unknown_keys = sorted(crop_keys - camera_keys)
-    if missing_keys:
-        raise ValueError(f"Missing crop params for camera keys: {missing_keys}")
-    if unknown_keys:
-        raise ValueError(f"Unknown crop params for non-camera keys: {unknown_keys}")
+    if dataset_cfg.crop.enable:
+        if not dataset_cfg.crop.params:
+            raise ValueError("dataset.crop.enable is true but dataset.crop.params is empty")
 
-    processed_location = _get_processed_dataset_location(dataset_cfg)
+        camera_keys = set(source_dataset.meta.camera_keys)
+        crop_keys = set(dataset_cfg.crop.params)
+        missing_keys = sorted(camera_keys - crop_keys)
+        unknown_keys = sorted(crop_keys - camera_keys)
+        if missing_keys:
+            raise ValueError(f"Missing crop params for camera keys: {missing_keys}")
+        if unknown_keys:
+            raise ValueError(f"Unknown crop params for non-camera keys: {unknown_keys}")
+
+        processed_location = _get_processed_dataset_location(dataset_cfg)
+        processed_root = Path(processed_location.root)
+        if _is_valid_processed_dataset_root(processed_root):
+            logging.info("Reusing cropped training dataset from %s", processed_root)
+            return processed_location
+
+        if processed_root.exists():
+            shutil.rmtree(processed_root)
+        processed_root.parent.mkdir(parents=True, exist_ok=True)
+
+        logging.info(
+            "Creating cropped training dataset at %s from source dataset %s",
+            processed_root,
+            dataset_cfg.repo_id,
+        )
+        convert_lerobot_dataset_to_cropped_lerobot_dataset(
+            original_dataset=source_dataset,
+            crop_params_dict=dataset_cfg.crop.params,
+            new_repo_id=processed_location.repo_id,
+            new_dataset_root=processed_root,
+            resize_size=dataset_cfg.crop.resize_size,
+            push_to_hub=False,
+            task=None,
+        )
+        _write_crop_metadata(processed_root, dataset_cfg)
+        return processed_location
+
+    processed_location = _get_resize_padded_dataset_location(dataset_cfg)
     processed_root = Path(processed_location.root)
     if _is_valid_processed_dataset_root(processed_root):
-        logging.info("Reusing cropped training dataset from %s", processed_root)
+        logging.info("Reusing resize-padded training dataset from %s", processed_root)
         return processed_location
 
     if processed_root.exists():
@@ -180,20 +246,19 @@ def _resolve_dataset_location(dataset_cfg: DatasetConfig) -> _ResolvedDatasetLoc
     processed_root.parent.mkdir(parents=True, exist_ok=True)
 
     logging.info(
-        "Creating cropped training dataset at %s from source dataset %s",
+        "Creating resize-padded training dataset at %s from source dataset %s",
         processed_root,
         dataset_cfg.repo_id,
     )
-    convert_lerobot_dataset_to_cropped_lerobot_dataset(
+    convert_lerobot_dataset_to_resized_padded_lerobot_dataset(
         original_dataset=source_dataset,
-        crop_params_dict=dataset_cfg.crop.params,
         new_repo_id=processed_location.repo_id,
         new_dataset_root=processed_root,
-        resize_size=dataset_cfg.crop.resize_size,
+        resize_size=dataset_cfg.resize_pad.resize_size,
         push_to_hub=False,
         task=None,
     )
-    _write_crop_metadata(processed_root, dataset_cfg)
+    _write_resize_pad_metadata(processed_root, dataset_cfg)
     return processed_location
 
 
@@ -268,6 +333,53 @@ def _split_episode_indices(
     return train_episodes, val_episodes
 
 
+def _load_episode_stats(ds_meta: LeRobotDatasetMetadata, episode_indices: list[int]) -> dict[str, dict]:
+    episode_paths: dict[tuple[int, int], list[int]] = {}
+    for episode_idx in episode_indices:
+        episode = ds_meta.episodes[episode_idx]
+        chunk_idx = int(episode["meta/episodes/chunk_index"])
+        file_idx = int(episode["meta/episodes/file_index"])
+        episode_paths.setdefault((chunk_idx, file_idx), []).append(int(episode_idx))
+
+    selected_stats = []
+    for (chunk_idx, file_idx), episodes_in_file in episode_paths.items():
+        parquet_path = ds_meta.root / DEFAULT_EPISODES_PATH.format(
+            chunk_index=chunk_idx, file_index=file_idx
+        )
+        df = pd.read_parquet(parquet_path)
+        matching_rows = df[df["episode_index"].isin(episodes_in_file)]
+
+        for row in matching_rows.to_dict(orient="records"):
+            flat_stats = {
+                key.removeprefix("stats/"): np.asarray(value)
+                for key, value in row.items()
+                if key.startswith("stats/")
+            }
+            if not flat_stats:
+                raise ValueError(f"No episode stats were found for episode {row['episode_index']} in {parquet_path}")
+            selected_stats.append(unflatten_dict(flat_stats))
+
+    if len(selected_stats) != len(episode_indices):
+        raise ValueError(
+            f"Failed to load stats for all selected training episodes. "
+            f"Expected {len(episode_indices)}, loaded {len(selected_stats)}."
+        )
+
+    return aggregate_stats(selected_stats)
+
+
+def _apply_train_split_stats(
+    ds_meta: LeRobotDatasetMetadata,
+    train_episodes: list[int],
+    train_dataset: LeRobotDataset | StreamingLeRobotDataset,
+    val_dataset: LeRobotDataset | StreamingLeRobotDataset | None,
+) -> None:
+    train_stats = _load_episode_stats(ds_meta, train_episodes)
+    train_dataset.meta.stats = train_stats
+    if val_dataset is not None:
+        val_dataset.meta.stats = deepcopy(train_stats)
+
+
 def make_train_val_datasets(
     cfg: TrainPipelineConfig,
 ) -> tuple[LeRobotDataset | HeterogeneousLeRobotDataset, LeRobotDataset | None]:
@@ -338,6 +450,9 @@ def make_train_val_datasets(
                 image_transforms=train_image_transforms,
             )
             val_dataset = None
+
+        if val_dataset is not None and not cfg.dataset.use_imagenet_stats:
+            _apply_train_split_stats(ds_meta, train_episodes, train_dataset, val_dataset)
 
     if cfg.dataset.use_imagenet_stats:
         _apply_imagenet_stats(train_dataset)

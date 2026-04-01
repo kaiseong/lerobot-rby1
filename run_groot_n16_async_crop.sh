@@ -13,10 +13,11 @@ CLIENT_DEVICE="${CLIENT_DEVICE:-cpu}"
 ZMQ_TIMEOUT_MS="${ZMQ_TIMEOUT_MS:-5000}"
 
 GROOT_FRONT_CAMERA_KEY="${GROOT_FRONT_CAMERA_KEY:-front}"
+GROOT_LEFT_WRIST_CAMERA_KEY="${GROOT_LEFT_WRIST_CAMERA_KEY:-left}"
 GROOT_RIGHT_WRIST_CAMERA_KEY="${GROOT_RIGHT_WRIST_CAMERA_KEY:-right}"
-GROOT_IMAGE_SIZE="${GROOT_IMAGE_SIZE:-[480,480]}"
+GROOT_IMAGE_SIZE="${GROOT_IMAGE_SIZE:-[480,640]}"
 
-IMAGE_CROP_PARAMS="${IMAGE_CROP_PARAMS:-{\"front\":[0,80,480,480],\"right\":[160,0,480,480]}}"
+IMAGE_CROP_PARAMS="${IMAGE_CROP_PARAMS:-{}}"
 
 PYTHONPATH=src python -m lerobot.async_inference.robot_client \
   --backend=groot_n16_zmq \
@@ -24,8 +25,9 @@ PYTHONPATH=src python -m lerobot.async_inference.robot_client \
   --robot.type=rby1 \
   --robot.address="${ROBOT_ADDRESS}" \
   --robot.use_torso=false \
+  --robot.observe_torso=true \
   --robot.use_right_arm=true \
-  --robot.use_left_arm=false \
+  --robot.use_left_arm=true \
   --robot.use_gripper=true \
   --task="${TASK}" \
   --actions_per_chunk="${ACTIONS_PER_CHUNK}" \
@@ -33,6 +35,7 @@ PYTHONPATH=src python -m lerobot.async_inference.robot_client \
   --client_device="${CLIENT_DEVICE}" \
   --zmq_timeout_ms="${ZMQ_TIMEOUT_MS}" \
   --groot_front_camera_key="${GROOT_FRONT_CAMERA_KEY}" \
+  --groot_left_wrist_camera_key="${GROOT_LEFT_WRIST_CAMERA_KEY}" \
   --groot_right_wrist_camera_key="${GROOT_RIGHT_WRIST_CAMERA_KEY}" \
   --groot_image_size="${GROOT_IMAGE_SIZE}" \
   --image_crop_params="${IMAGE_CROP_PARAMS}"

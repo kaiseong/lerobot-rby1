@@ -58,6 +58,21 @@ class DatasetCropConfig:
 
 
 @dataclass
+class DatasetResizePadConfig:
+    enable: bool = False
+    resize_size: tuple[int, int] = (224, 224)
+
+    def __post_init__(self) -> None:
+        if len(self.resize_size) != 2:
+            raise ValueError(f"resize_size must contain two values, got {self.resize_size}")
+
+        resize_height, resize_width = (int(v) for v in self.resize_size)
+        if resize_height <= 0 or resize_width <= 0:
+            raise ValueError(f"resize_size must use positive values, got {self.resize_size}")
+        self.resize_size = (resize_height, resize_width)
+
+
+@dataclass
 class DatasetSourceConfig:
     repo_id: str
     root: str | None = None
@@ -85,6 +100,7 @@ class DatasetConfig:
     sources: list[DatasetSourceConfig] = field(default_factory=list)
     mixing_strategy: str = "uniform"
     crop: DatasetCropConfig = field(default_factory=DatasetCropConfig)
+    resize_pad: DatasetResizePadConfig = field(default_factory=DatasetResizePadConfig)
     val_ratio: float = 0.0
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
@@ -93,6 +109,9 @@ class DatasetConfig:
     streaming: bool = False
 
     def __post_init__(self) -> None:
+        if self.crop.enable and self.resize_pad.enable:
+            raise ValueError("dataset.crop and dataset.resize_pad cannot be enabled at the same time")
+
         self.val_ratio = float(self.val_ratio)
         if not 0.0 <= self.val_ratio < 1.0:
             raise ValueError(f"dataset.val_ratio must be in [0.0, 1.0), got {self.val_ratio}")
@@ -113,6 +132,8 @@ class DatasetConfig:
                 raise ValueError("dataset.revision is only supported for single-dataset training")
             if self.crop.enable:
                 raise ValueError("dataset.crop is not supported together with dataset.sources")
+            if self.resize_pad.enable:
+                raise ValueError("dataset.resize_pad is not supported together with dataset.sources")
             if self.streaming:
                 raise ValueError("dataset.streaming is not supported together with dataset.sources")
             if self.val_ratio > 0:

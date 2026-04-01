@@ -75,6 +75,11 @@ from .policy_robot_bridge import (
     RobotActionToPolicyActionProcessorStep,
 )
 from .rename_processor import RenameObservationsProcessorStep
+from .spatial_preprocess_processor import (
+    ObservationImageSpatialPreprocessStep,
+    SPATIAL_PREPROCESSOR_REGISTRY_NAME,
+    preprocessor_has_active_spatial_preprocess,
+)
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
@@ -116,6 +121,8 @@ __all__ = [
     "RenameObservationsProcessorStep",
     "RewardClassifierProcessorStep",
     "RewardProcessorStep",
+    "ObservationImageSpatialPreprocessStep",
+    "SPATIAL_PREPROCESSOR_REGISTRY_NAME",
     "DataProcessorPipeline",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
@@ -125,6 +132,7 @@ __all__ = [
     "Torch2NumpyActionProcessorStep",
     "RobotActionToPolicyActionProcessorStep",
     "PolicyActionToRobotActionProcessorStep",
+    "preprocessor_has_active_spatial_preprocess",
     "transition_to_batch",
     "TransitionKey",
     "TruncatedProcessorStep",

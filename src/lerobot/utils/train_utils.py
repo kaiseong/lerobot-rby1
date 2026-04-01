@@ -13,7 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from copy import copy
 from pathlib import Path
+from typing import Any
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -23,7 +25,11 @@ from lerobot.datasets.utils import load_json, write_json
 from lerobot.optim.optimizers import load_optimizer_state, save_optimizer_state
 from lerobot.optim.schedulers import load_scheduler_state, save_scheduler_state
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import (
+    ObservationImageSpatialPreprocessStep,
+    PolicyProcessorPipeline,
+    SPATIAL_PREPROCESSOR_REGISTRY_NAME,
+)
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
@@ -32,6 +38,84 @@ from lerobot.utils.constants import (
     TRAINING_STEP,
 )
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
+
+
+def build_saved_inference_preprocessor(
+    preprocessor: PolicyProcessorPipeline | None, cfg: TrainPipelineConfig
+) -> PolicyProcessorPipeline | None:
+    if preprocessor is None:
+        return None
+
+    spatial_step = _make_spatial_preprocess_step(cfg)
+    if spatial_step is None:
+        return preprocessor
+
+    if preprocessor.steps:
+        first_step = preprocessor.steps[0]
+        if (
+            getattr(first_step.__class__, "_registry_name", None) == SPATIAL_PREPROCESSOR_REGISTRY_NAME
+            and hasattr(first_step, "get_config")
+            and first_step.get_config() == spatial_step.get_config()
+        ):
+            return preprocessor
+
+    filtered_steps = [
+        step
+        for step in preprocessor.steps
+        if getattr(step.__class__, "_registry_name", None) != SPATIAL_PREPROCESSOR_REGISTRY_NAME
+    ]
+
+    return PolicyProcessorPipeline(
+        steps=[spatial_step, *filtered_steps],
+        name=preprocessor.name,
+        to_transition=preprocessor.to_transition,
+        to_output=preprocessor.to_output,
+        before_step_hooks=copy(preprocessor.before_step_hooks),
+        after_step_hooks=copy(preprocessor.after_step_hooks),
+    )
+
+
+def get_training_spatial_preprocess_override(cfg: TrainPipelineConfig) -> dict[str, dict[str, Any]]:
+    spatial_step = _make_spatial_preprocess_step(cfg)
+    if spatial_step is None:
+        return {}
+
+    return {
+        SPATIAL_PREPROCESSOR_REGISTRY_NAME: {
+            "mode": "none",
+        }
+    }
+
+
+def disable_runtime_spatial_preprocess(
+    preprocessor: PolicyProcessorPipeline | None, cfg: TrainPipelineConfig
+) -> PolicyProcessorPipeline | None:
+    if preprocessor is None or _make_spatial_preprocess_step(cfg) is None:
+        return preprocessor
+
+    for step in preprocessor.steps:
+        if getattr(step.__class__, "_registry_name", None) != SPATIAL_PREPROCESSOR_REGISTRY_NAME:
+            continue
+        step.mode = "none"
+        if hasattr(step, "crop_params_dict"):
+            step.crop_params_dict = {}
+
+    return preprocessor
+
+
+def _make_spatial_preprocess_step(cfg: TrainPipelineConfig) -> ObservationImageSpatialPreprocessStep | None:
+    if cfg.dataset.crop.enable:
+        return ObservationImageSpatialPreprocessStep(
+            mode="crop",
+            resize_size=cfg.dataset.crop.resize_size,
+            crop_params_dict=cfg.dataset.crop.params,
+        )
+    if cfg.dataset.resize_pad.enable:
+        return ObservationImageSpatialPreprocessStep(
+            mode="resize_pad",
+            resize_size=cfg.dataset.resize_pad.resize_size,
+        )
+    return None
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -104,7 +188,8 @@ def save_checkpoint(
         # policy config which we need for loading the model. In this case we'll write it ourselves.
         policy.config.save_pretrained(pretrained_dir)
     if preprocessor is not None:
-        preprocessor.save_pretrained(pretrained_dir)
+        saved_preprocessor = build_saved_inference_preprocessor(preprocessor, cfg)
+        saved_preprocessor.save_pretrained(pretrained_dir)
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
     save_training_state(checkpoint_dir, step, optimizer, scheduler)

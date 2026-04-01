@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import io
-from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -23,8 +22,12 @@ import torch
 
 from .helpers import TimedAction
 
-GROOT_N16_ACTION_KEYS = [f"right_arm_{i}" for i in range(7)] + ["right_gripper_0"]
-GROOT_N16_ARM_KEYS = [f"right_arm_{i}" for i in range(7)]
+GROOT_N16_TORSO_KEYS = [f"torso_{i}" for i in range(6)]
+GROOT_N16_RIGHT_ARM_KEYS = [f"right_arm_{i}" for i in range(7)]
+GROOT_N16_LEFT_ARM_KEYS = [f"left_arm_{i}" for i in range(7)]
+GROOT_N16_GRIPPER_KEYS = ["right_gripper_0", "left_gripper_0"]
+GROOT_N16_ACTION_KEYS = [*GROOT_N16_RIGHT_ARM_KEYS, *GROOT_N16_LEFT_ARM_KEYS, *GROOT_N16_GRIPPER_KEYS]
+GROOT_N16_STATE_KEYS = [*GROOT_N16_TORSO_KEYS, *GROOT_N16_RIGHT_ARM_KEYS, *GROOT_N16_LEFT_ARM_KEYS, *GROOT_N16_GRIPPER_KEYS]
 
 
 def _import_zmq_dependencies():
@@ -140,18 +143,20 @@ def validate_groot_robot_compatibility(
     robot: Any,
     *,
     front_camera_key: str,
+    left_wrist_camera_key: str,
     right_wrist_camera_key: str,
 ) -> None:
     action_keys = list(robot.action_features)
     if action_keys != GROOT_N16_ACTION_KEYS:
         raise ValueError(
-            "The 'groot_n16_zmq' backend currently supports only right_arm_0..6 + right_gripper_0. "
+            "The 'groot_n16_zmq' backend currently supports only torso state + "
+            "right_arm_0..6 + left_arm_0..6 + right_gripper_0 + left_gripper_0 actions. "
             f"Received action features: {action_keys}"
         )
 
     missing_keys = [
         key
-        for key in [*GROOT_N16_ACTION_KEYS, front_camera_key, right_wrist_camera_key]
+        for key in [*GROOT_N16_STATE_KEYS, front_camera_key, left_wrist_camera_key, right_wrist_camera_key]
         if key not in robot.observation_features
     ]
     if missing_keys:
@@ -177,7 +182,7 @@ def _resize_image(image: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
     )
 
 
-def ensure_uint8_hwc_image(image: Any, image_size: tuple[int, int]) -> np.ndarray:
+def _ensure_uint8_hwc_image(image: Any) -> np.ndarray:
     image_arr = np.asarray(image)
     if image_arr.ndim != 3 or image_arr.shape[2] != 3:
         raise ValueError(f"Expected image with shape (H, W, 3), got {image_arr.shape}")
@@ -189,37 +194,78 @@ def ensure_uint8_hwc_image(image: Any, image_size: tuple[int, int]) -> np.ndarra
                 image_arr = image_arr * 255.0
         image_arr = image_arr.astype(np.uint8)
 
-    return _resize_image(np.ascontiguousarray(image_arr), image_size)
+    return np.ascontiguousarray(image_arr)
+
+
+def ensure_uint8_hwc_image(image: Any, image_size: tuple[int, int]) -> np.ndarray:
+    return _resize_image(_ensure_uint8_hwc_image(image), image_size)
+
+
+def preprocess_groot_front_image(image: Any, image_size: tuple[int, int]) -> np.ndarray:
+    return ensure_uint8_hwc_image(image, image_size)
+
+
+def preprocess_groot_wrist_image(image: Any, image_size: tuple[int, int]) -> np.ndarray:
+    target_height, target_width = image_size
+    if target_width < target_height:
+        raise ValueError(
+            f"GR00T wrist preprocessing expects width >= height for horizontal padding, got {image_size}"
+        )
+
+    image_arr = _ensure_uint8_hwc_image(image)
+    image_height, image_width = image_arr.shape[:2]
+    if image_height < target_height or image_width < target_height:
+        raise ValueError(
+            "GR00T wrist preprocessing requires an image at least as large as the target bottom crop: "
+            f"image={image_arr.shape[:2]}, target={image_size}"
+        )
+
+    crop_top = image_height - target_height
+    cropped = image_arr[crop_top:image_height, :target_height, :]
+    horizontal_padding = target_width - target_height
+    pad_left = horizontal_padding // 2
+    pad_right = horizontal_padding - pad_left
+    padded = np.pad(cropped, ((0, 0), (pad_left, pad_right), (0, 0)), mode="constant")
+    return np.ascontiguousarray(padded)
 
 
 def build_groot_n16_observation(
     raw_observation: dict[str, Any],
     *,
     front_camera_key: str,
+    left_wrist_camera_key: str,
     right_wrist_camera_key: str,
     image_size: tuple[int, int],
 ) -> dict[str, Any]:
     missing_keys = [
         key
-        for key in [*GROOT_N16_ARM_KEYS, "right_gripper_0", front_camera_key, right_wrist_camera_key]
+        for key in [*GROOT_N16_STATE_KEYS, front_camera_key, left_wrist_camera_key, right_wrist_camera_key]
         if key not in raw_observation
     ]
     if missing_keys:
         raise KeyError(f"Raw observation missing keys required by GR00T backend: {missing_keys}")
 
-    front_image = ensure_uint8_hwc_image(raw_observation[front_camera_key], image_size)
-    right_image = ensure_uint8_hwc_image(raw_observation[right_wrist_camera_key], image_size)
-    right_arm = np.asarray([raw_observation[key] for key in GROOT_N16_ARM_KEYS], dtype=np.float32)
+    front_image = preprocess_groot_front_image(raw_observation[front_camera_key], image_size)
+    left_image = preprocess_groot_wrist_image(raw_observation[left_wrist_camera_key], image_size)
+    right_image = preprocess_groot_wrist_image(raw_observation[right_wrist_camera_key], image_size)
+    torso = np.asarray([raw_observation[key] for key in GROOT_N16_TORSO_KEYS], dtype=np.float32)
+    right_arm = np.asarray([raw_observation[key] for key in GROOT_N16_RIGHT_ARM_KEYS], dtype=np.float32)
+    left_arm = np.asarray([raw_observation[key] for key in GROOT_N16_LEFT_ARM_KEYS], dtype=np.float32)
     right_gripper = np.asarray([raw_observation["right_gripper_0"]], dtype=np.float32)
+    left_gripper = np.asarray([raw_observation["left_gripper_0"]], dtype=np.float32)
     task = str(raw_observation.get("task", ""))
 
     return {
         "video": {
             "cam_front_head": front_image[np.newaxis, np.newaxis],
+            "cam_left_wrist": left_image[np.newaxis, np.newaxis],
             "cam_right_wrist": right_image[np.newaxis, np.newaxis],
         },
         "state": {
+            "torso": torso[np.newaxis, np.newaxis],
+            "left_arm": left_arm[np.newaxis, np.newaxis],
             "right_arm": right_arm[np.newaxis, np.newaxis],
+            "left_gripper": left_gripper[np.newaxis, np.newaxis],
             "right_gripper": right_gripper[np.newaxis, np.newaxis],
         },
         "language": {
@@ -236,24 +282,33 @@ def groot_n16_action_dict_to_timed_actions(
     environment_dt: float,
     client_device: str = "cpu",
 ) -> list[TimedAction]:
+    left_arm = np.asarray(action_dict.get("left_arm"), dtype=np.float32)
     right_arm = np.asarray(action_dict.get("right_arm"), dtype=np.float32)
+    left_gripper = np.asarray(action_dict.get("left_gripper"), dtype=np.float32)
     right_gripper = np.asarray(action_dict.get("right_gripper"), dtype=np.float32)
 
+    if left_arm.shape[:1] != (1,) or left_arm.ndim != 3 or left_arm.shape[2] != 7:
+        raise ValueError(f"Expected left_arm shape (1, T, 7), got {left_arm.shape}")
     if right_arm.shape[:1] != (1,) or right_arm.ndim != 3 or right_arm.shape[2] != 7:
         raise ValueError(f"Expected right_arm shape (1, T, 7), got {right_arm.shape}")
+    if left_gripper.shape[:1] != (1,) or left_gripper.ndim != 3 or left_gripper.shape[2] != 1:
+        raise ValueError(f"Expected left_gripper shape (1, T, 1), got {left_gripper.shape}")
     if right_gripper.shape[:1] != (1,) or right_gripper.ndim != 3 or right_gripper.shape[2] != 1:
         raise ValueError(f"Expected right_gripper shape (1, T, 1), got {right_gripper.shape}")
-    if right_arm.shape[1] != right_gripper.shape[1]:
+    if not (
+        left_arm.shape[1] == right_arm.shape[1] == left_gripper.shape[1] == right_gripper.shape[1]
+    ):
         raise ValueError(
             "GR00T action chunk lengths do not match: "
-            f"right_arm={right_arm.shape[1]}, right_gripper={right_gripper.shape[1]}"
+            f"left_arm={left_arm.shape[1]}, right_arm={right_arm.shape[1]}, "
+            f"left_gripper={left_gripper.shape[1]}, right_gripper={right_gripper.shape[1]}"
         )
 
     device = torch.device(client_device)
     timed_actions = []
     for i in range(right_arm.shape[1]):
         action_tensor = torch.from_numpy(
-            np.concatenate([right_arm[0, i], right_gripper[0, i]], axis=0)
+            np.concatenate([right_arm[0, i], left_arm[0, i], right_gripper[0, i], left_gripper[0, i]], axis=0)
         ).to(device=device, dtype=torch.float32)
         timed_actions.append(
             TimedAction(

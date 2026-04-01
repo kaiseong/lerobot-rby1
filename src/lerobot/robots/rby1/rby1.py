@@ -347,7 +347,18 @@ class Rby1(Robot):
     # ------------------------------------------------------------------ #
 
     @property
-    def _motors_ft(self) -> dict[str, type]:
+    def _observation_joint_names(self) -> list[str]:
+        names: list[str] = []
+        if self._config.use_torso or self._config.observe_torso:
+            names += _TORSO_NAMES
+        if self._config.use_right_arm:
+            names += _RIGHT_ARM_NAMES
+        if self._config.use_left_arm:
+            names += _LEFT_ARM_NAMES
+        return names
+
+    @property
+    def _action_joint_names(self) -> list[str]:
         names: list[str] = []
         if self._config.use_torso:
             names += _TORSO_NAMES
@@ -355,7 +366,15 @@ class Rby1(Robot):
             names += _RIGHT_ARM_NAMES
         if self._config.use_left_arm:
             names += _LEFT_ARM_NAMES
-        return {name: float for name in names}
+        return names
+
+    @property
+    def _observation_motors_ft(self) -> dict[str, type]:
+        return {name: float for name in self._observation_joint_names}
+
+    @property
+    def _motors_ft(self) -> dict[str, type]:
+        return {name: float for name in self._action_joint_names}
 
     @property
     def _gripper_ft(self) -> dict[str, type]:
@@ -381,12 +400,12 @@ class Rby1(Robot):
 
     @property
     def observation_features(self) -> dict[str, Any]:
-        features: dict[str, Any] = {**self._motors_ft, **self._gripper_ft}
+        features: dict[str, Any] = {**self._observation_motors_ft, **self._gripper_ft}
         if self._config.use_velocity:
-            for name in _ALL_JOINT_NAMES:
+            for name in self._observation_joint_names:
                 features[f"{name}.vel"] = float
         if self._config.use_torque:
-            for name in _ALL_JOINT_NAMES:
+            for name in self._observation_joint_names:
                 features[f"{name}.torque"] = float
         features.update(self._cameras_ft)
         return features
@@ -617,7 +636,7 @@ class Rby1(Robot):
         left_pos = pos[model.left_arm_idx]          # (7,)
 
         obs: dict[str, Any] = {}
-        if self._config.use_torso:
+        if self._config.use_torso or self._config.observe_torso:
             for i, name in enumerate(_TORSO_NAMES):
                 obs[name] = float(torso_pos[i])
         if self._config.use_right_arm:
@@ -633,7 +652,7 @@ class Rby1(Robot):
             torso_vel = vel[model.torso_idx]
             right_vel = vel[model.right_arm_idx]
             left_vel = vel[model.left_arm_idx]
-            if self._config.use_torso:
+            if self._config.use_torso or self._config.observe_torso:
                 for i, name in enumerate(_TORSO_NAMES):
                     obs[f"{name}.vel"] = float(torso_vel[i])
             if self._config.use_right_arm:
@@ -649,7 +668,7 @@ class Rby1(Robot):
             torso_trq = torque[model.torso_idx]
             right_trq = torque[model.right_arm_idx]
             left_trq = torque[model.left_arm_idx]
-            if self._config.use_torso:
+            if self._config.use_torso or self._config.observe_torso:
                 for i, name in enumerate(_TORSO_NAMES):
                     obs[f"{name}.torque"] = float(torso_trq[i])
             if self._config.use_right_arm:

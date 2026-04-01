@@ -65,6 +65,12 @@ class PolicyServerConfig:
     obs_queue_timeout: float = field(
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
+    logging: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to save raw images received by the gRPC server and action chunks sent to the client"
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -98,6 +104,7 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "logging": self.logging,
         }
 
 
@@ -162,8 +169,12 @@ class RobotClientConfig:
         default="right",
         metadata={"help": "Robot observation key mapped to GR00T cam_right_wrist"},
     )
+    groot_left_wrist_camera_key: str = field(
+        default="left",
+        metadata={"help": "Robot observation key mapped to GR00T cam_left_wrist"},
+    )
     groot_image_size: tuple[int, int] = field(
-        default=(480, 480),
+        default=(480, 640),
         metadata={"help": "Final (height, width) of GR00T camera observations after crop/resize"},
     )
 
@@ -222,6 +233,9 @@ class RobotClientConfig:
         if not self.groot_right_wrist_camera_key:
             raise ValueError("groot_right_wrist_camera_key cannot be empty")
 
+        if not self.groot_left_wrist_camera_key:
+            raise ValueError("groot_left_wrist_camera_key cannot be empty")
+
         if len(self.groot_image_size) != 2:
             raise ValueError(
                 f"groot_image_size must be a pair of integers (height, width), got {self.groot_image_size}"
@@ -274,6 +288,7 @@ class RobotClientConfig:
             "image_crop_params": self.image_crop_params,
             "zmq_timeout_ms": self.zmq_timeout_ms,
             "groot_front_camera_key": self.groot_front_camera_key,
+            "groot_left_wrist_camera_key": self.groot_left_wrist_camera_key,
             "groot_right_wrist_camera_key": self.groot_right_wrist_camera_key,
             "groot_image_size": self.groot_image_size,
             "task": self.task,

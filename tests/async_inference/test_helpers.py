@@ -375,6 +375,23 @@ def test_prepare_raw_observation():
     assert isinstance(phone_img, torch.Tensor)
 
 
+def test_prepare_raw_observation_without_legacy_resize():
+    robot_obs = _create_mock_robot_observation()
+    lerobot_features = _create_mock_lerobot_features()
+    policy_image_features = _create_mock_policy_image_features()
+
+    prepared = prepare_raw_observation(
+        robot_obs,
+        lerobot_features,
+        policy_image_features,
+        apply_legacy_resize=False,
+    )
+
+    assert prepared[f"{OBS_IMAGES}.laptop"].shape == (3, 480, 640)
+    assert prepared[f"{OBS_IMAGES}.phone"].shape == (3, 480, 640)
+    assert prepared[OBS_STATE].shape == (1, 4)
+
+
 def test_raw_observation_to_observation_basic():
     """Test the main raw_observation_to_observation function."""
     robot_obs = _create_mock_robot_observation()
@@ -406,6 +423,22 @@ def test_raw_observation_to_observation_basic():
     assert phone_img.dtype == torch.float32
     assert laptop_img.min() >= 0.0 and laptop_img.max() <= 1.0
     assert phone_img.min() >= 0.0 and phone_img.max() <= 1.0
+
+
+def test_raw_observation_to_observation_without_legacy_resize():
+    robot_obs = _create_mock_robot_observation()
+    lerobot_features = _create_mock_lerobot_features()
+    policy_image_features = _create_mock_policy_image_features()
+
+    observation = raw_observation_to_observation(
+        robot_obs,
+        lerobot_features,
+        policy_image_features,
+        apply_legacy_resize=False,
+    )
+
+    assert observation[f"{OBS_IMAGES}.laptop"].shape == (1, 3, 480, 640)
+    assert observation[f"{OBS_IMAGES}.phone"].shape == (1, 3, 480, 640)
 
 
 def test_raw_observation_to_observation_with_non_tensor_data():

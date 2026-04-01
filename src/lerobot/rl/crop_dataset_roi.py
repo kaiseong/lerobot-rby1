@@ -27,6 +27,11 @@ from tqdm import tqdm  # type: ignore
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import resolve_vcodec
 from lerobot.utils.constants import DONE, REWARD
+from lerobot.utils.image_preprocessing import (
+    normalize_crop_params_dict,
+    normalize_resize_size,
+    resize_with_pad_torch,
+)
 
 
 def select_rect_roi(img):
@@ -163,24 +168,6 @@ def get_image_from_lerobot_dataset(dataset: LeRobotDataset):
     return image_dict
 
 
-def _normalize_crop_params_dict(
-    crop_params_dict: dict[str, tuple[int, int, int, int] | list[int]],
-) -> dict[str, tuple[int, int, int, int]]:
-    normalized = {}
-    for key, value in crop_params_dict.items():
-        if len(value) != 4:
-            raise ValueError(f"crop_params_dict['{key}'] must have four values, got {value}")
-
-        top, left, height, width = (int(v) for v in value)
-        if top < 0 or left < 0:
-            raise ValueError(f"crop_params_dict['{key}'] must use non-negative top/left offsets, got {value}")
-        if height <= 0 or width <= 0:
-            raise ValueError(f"crop_params_dict['{key}'] must use positive height/width, got {value}")
-
-        normalized[key] = (top, left, height, width)
-    return normalized
-
-
 def _resolve_crop_vcodec(dataset: LeRobotDataset) -> str:
     if not dataset.meta.video_keys:
         return "libsvtav1"
@@ -228,7 +215,7 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
         LeRobotDataset: A new LeRobotDataset where the specified image observations have been cropped
         and resized.
     """
-    crop_params_dict = _normalize_crop_params_dict(crop_params_dict)
+    crop_params_dict = normalize_crop_params_dict(crop_params_dict)
     camera_keys = set(original_dataset.meta.camera_keys)
     crop_keys = set(crop_params_dict)
     missing_keys = sorted(camera_keys - crop_keys)
@@ -238,9 +225,7 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
     if unknown_keys:
         raise ValueError(f"Unknown crop params for non-camera keys: {unknown_keys}")
 
-    resize_size = tuple(int(v) for v in resize_size)
-    if len(resize_size) != 2 or resize_size[0] <= 0 or resize_size[1] <= 0:
-        raise ValueError(f"resize_size must contain two positive values, got {resize_size}")
+    resize_size = normalize_resize_size(resize_size)
 
     new_dataset = LeRobotDataset.create(
         repo_id=new_repo_id,
@@ -285,6 +270,75 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
                 if isinstance(value, torch.Tensor) and value.dim() == 3:
                     value = value.permute(1, 2, 0)
                 value = value.clamp(0, 1)
+            if key.startswith("complementary_info") and isinstance(value, torch.Tensor) and value.dim() == 0:
+                value = value.unsqueeze(0)
+            new_frame[key] = value
+
+        new_frame["task"] = task if task else frame["task"]
+        new_dataset.add_frame(new_frame)
+
+    if previous_episode_index is not None:
+        new_dataset.save_episode()
+
+    new_dataset.finalize()
+
+    if push_to_hub:
+        new_dataset.push_to_hub()
+
+    return new_dataset
+
+
+def convert_lerobot_dataset_to_resized_padded_lerobot_dataset(
+    original_dataset: LeRobotDataset,
+    new_repo_id: str,
+    new_dataset_root: str | Path,
+    resize_size: tuple[int, int] = (224, 224),
+    push_to_hub: bool = False,
+    task: str | None = None,
+) -> LeRobotDataset:
+    """Convert a LeRobot dataset by applying openpi-style resize-with-pad to every camera image."""
+    resize_size = normalize_resize_size(resize_size)
+
+    new_dataset = LeRobotDataset.create(
+        repo_id=new_repo_id,
+        fps=int(original_dataset.fps),
+        root=new_dataset_root,
+        robot_type=original_dataset.meta.robot_type,
+        features=deepcopy(original_dataset.meta.info["features"]),
+        use_videos=len(original_dataset.meta.video_keys) > 0,
+        vcodec=_resolve_crop_vcodec(original_dataset),
+    )
+    new_dataset.meta.update_chunk_settings(
+        chunks_size=original_dataset.meta.chunks_size,
+        data_files_size_in_mb=original_dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=original_dataset.meta.video_files_size_in_mb,
+    )
+
+    for key in original_dataset.meta.camera_keys:
+        if key in new_dataset.meta.info["features"]:
+            new_dataset.meta.info["features"][key]["shape"] = [*resize_size, 3]
+
+    previous_episode_index = None
+    for frame_idx in tqdm(range(len(original_dataset))):
+        frame = original_dataset[frame_idx]
+        frame_episode_index = int(frame["episode_index"].item())
+        if previous_episode_index is None:
+            previous_episode_index = frame_episode_index
+        elif frame_episode_index != previous_episode_index:
+            new_dataset.save_episode()
+            previous_episode_index = frame_episode_index
+
+        new_frame = {}
+        for key, value in frame.items():
+            if key in ("task_index", "timestamp", "episode_index", "frame_index", "index", "task"):
+                continue
+            if key in (DONE, REWARD) and isinstance(value, torch.Tensor) and value.dim() == 0:
+                value = value.unsqueeze(0)
+
+            if key in original_dataset.meta.camera_keys:
+                value = resize_with_pad_torch(value, resize_size)
+                value = value.permute(1, 2, 0).clamp(0, 1)
+
             if key.startswith("complementary_info") and isinstance(value, torch.Tensor) and value.dim() == 0:
                 value = value.unsqueeze(0)
             new_frame[key] = value

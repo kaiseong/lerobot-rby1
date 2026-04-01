@@ -30,18 +30,22 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
 
 import draccus
 import grpc
+import imageio.v3 as iio
+import numpy as np
 import torch
 
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
+    preprocessor_has_active_spatial_preprocess,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -89,6 +93,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self._apply_legacy_image_resize = True
+        self.payload_log_dir = self._initialize_payload_log_dir()
 
     @property
     def running(self):
@@ -97,6 +103,76 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     @property
     def policy_image_features(self):
         return self.policy.config.image_features
+
+    def _initialize_payload_log_dir(self) -> Path | None:
+        if not self.config.logging:
+            return None
+
+        payload_dir = Path("logs") / f"policy_server_payloads_{int(time.time())}"
+        payload_dir.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Payload logging enabled. Saving received images and actions to {payload_dir}")
+        return payload_dir
+
+    def _to_uint8_hwc_image(self, image: Any) -> np.ndarray:
+        image_arr = image.detach().cpu().numpy() if isinstance(image, torch.Tensor) else np.asarray(image)
+        if image_arr.ndim != 3:
+            raise ValueError(f"Expected 3D image array, got shape {image_arr.shape}")
+
+        # Accept CHW tensors if ever provided and convert them to HWC.
+        if image_arr.shape[-1] not in (1, 3) and image_arr.shape[0] in (1, 3):
+            image_arr = np.transpose(image_arr, (1, 2, 0))
+
+        if image_arr.shape[-1] not in (1, 3):
+            raise ValueError(f"Expected image with 1 or 3 channels, got shape {image_arr.shape}")
+
+        if image_arr.dtype != np.uint8:
+            image_arr = image_arr.astype(np.float32)
+            if image_arr.max(initial=0.0) <= 1.0:
+                image_arr = image_arr * 255.0
+            image_arr = np.clip(image_arr, 0.0, 255.0).astype(np.uint8)
+
+        if image_arr.shape[-1] == 1:
+            image_arr = np.repeat(image_arr, 3, axis=2)
+
+        return np.ascontiguousarray(image_arr)
+
+    def _save_logged_images(self, observation: dict[str, Any], sample_dir: Path) -> None:
+        image_dir = sample_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        for key, value in observation.items():
+            try:
+                image_arr = self._to_uint8_hwc_image(value)
+            except (TypeError, ValueError):
+                continue
+
+            filename = f"{key.replace('/', '_').replace('.', '_')}.png"
+            iio.imwrite(image_dir / filename, image_arr)
+
+    def _save_logged_actions(self, action_chunk: list[TimedAction], sample_dir: Path) -> None:
+        actions_path = sample_dir / "actions.txt"
+        action_lines = []
+        for timed_action in action_chunk:
+            action_lines.append(
+                "\t".join(
+                    [
+                        f"timestep={timed_action.get_timestep()}",
+                        f"timestamp={timed_action.get_timestamp():.6f}",
+                        f"action={timed_action.get_action().detach().cpu().tolist()}",
+                    ]
+                )
+            )
+
+        actions_path.write_text("\n".join(action_lines) + ("\n" if action_lines else ""), encoding="utf-8")
+
+    def _log_payload(self, observation_t: TimedObservation, action_chunk: list[TimedAction]) -> None:
+        if self.payload_log_dir is None:
+            return
+
+        sample_dir = self.payload_log_dir / f"step_{observation_t.get_timestep():06d}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        self._save_logged_images(observation_t.get_observation(), sample_dir)
+        self._save_logged_actions(action_chunk, sample_dir)
 
     def _reset_server(self) -> None:
         """Flushes server state when new client connects."""
@@ -156,15 +232,29 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
+        preprocessor_overrides = {
+            "device_processor": device_override,
+            "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+            **policy_specs.preprocessor_overrides,
+        }
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
+            preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
         )
+        if policy_specs.client_image_crop_applied and preprocessor_has_active_spatial_preprocess(self.preprocessor):
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=policy_specs.pretrained_name_or_path,
+                preprocessor_overrides={
+                    **preprocessor_overrides,
+                    "observation_image_spatial_preprocess": {"crop_params_dict": {}},
+                },
+                postprocessor_overrides={"device_processor": device_override},
+            )
+
+        self._apply_legacy_image_resize = not preprocessor_has_active_spatial_preprocess(self.preprocessor)
 
         end = time.perf_counter()
 
@@ -345,6 +435,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
+            apply_legacy_resize=self._apply_legacy_image_resize,
         )
         prepare_time = time.perf_counter() - start_prepare
 
@@ -403,6 +494,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
             f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
         )
+
+        self._log_payload(observation_t, action_chunk)
 
         return action_chunk
 

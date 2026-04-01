@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import time
 
+import numpy as np
 import pytest
 import torch
 
@@ -217,3 +218,44 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+@require_package("grpcio", "grpc")
+def test_predict_action_chunk_logs_payloads(monkeypatch, tmp_path):
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    monkeypatch.chdir(tmp_path)
+
+    server = PolicyServer(PolicyServerConfig(host="localhost", port=9999, logging=True))
+    server.policy = MockPolicy()
+    server.actions_per_chunk = 2
+    server.device = "cpu"
+    server.lerobot_features = {
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": [6],
+            "names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+        }
+    }
+    server.preprocessor = lambda obs: obs
+    server.postprocessor = lambda tensor: tensor
+
+    def _fake_get_action_chunk(_self, _obs, _type="act"):
+        return torch.zeros(1, 2, 6)
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
+
+    obs = _make_obs(torch.zeros(6), timestep=7)
+    obs.observation["front"] = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    timed_actions = server._predict_action_chunk(obs)
+
+    assert len(timed_actions) == 2
+    payload_root = next((tmp_path / "logs").glob("policy_server_payloads_*"))
+    sample_dir = payload_root / "step_000007"
+    assert (sample_dir / "images" / "front.png").is_file()
+    assert (sample_dir / "actions.txt").is_file()
+    actions_text = (sample_dir / "actions.txt").read_text(encoding="utf-8")
+    assert "timestep=7" in actions_text
+    assert "action=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]" in actions_text

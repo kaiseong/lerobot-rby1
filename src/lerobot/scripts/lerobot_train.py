@@ -42,6 +42,8 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
+    build_saved_inference_preprocessor,
+    disable_runtime_spatial_preprocess,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
@@ -168,7 +170,10 @@ def _infer_batch_size(batch: Any) -> int:
     return 1
 
 
-def _extract_scalar_metrics(output_dict: dict[str, Any]) -> dict[str, float]:
+def _extract_scalar_metrics(output_dict: dict[str, Any] | None) -> dict[str, float]:
+    if not output_dict:
+        return {}
+
     scalar_metrics = {}
     for key, value in output_dict.items():
         if isinstance(value, (int, float)):
@@ -178,6 +183,17 @@ def _extract_scalar_metrics(output_dict: dict[str, Any]) -> dict[str, float]:
     return scalar_metrics
 
 
+def _get_preprocessor_trainable_steps(preprocessor) -> list[Any]:
+    if preprocessor is None:
+        return []
+
+    return [
+        step
+        for step in getattr(preprocessor, "steps", [])
+        if hasattr(step, "train") and hasattr(step, "training")
+    ]
+
+
 def run_validation(
     policy: PreTrainedPolicy,
     dataloader,
@@ -185,7 +201,11 @@ def run_validation(
     accelerator: Accelerator,
 ) -> dict[str, float]:
     was_training = policy.training
+    preprocessor_steps = _get_preprocessor_trainable_steps(preprocessor)
+    preprocessor_step_modes = [(step, bool(step.training)) for step in preprocessor_steps]
     policy.eval()
+    for step, _ in preprocessor_step_modes:
+        step.train(False)
     accelerator.wait_for_everyone()
 
     total_loss = torch.zeros((), device=accelerator.device, dtype=torch.float64)
@@ -193,42 +213,47 @@ def run_validation(
     metric_sums: dict[str, torch.Tensor] = {}
     start_time = time.perf_counter()
 
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = preprocessor(batch)
-            batch_size = _infer_batch_size(batch)
-            batch_weight = torch.tensor(float(batch_size), device=accelerator.device, dtype=torch.float64)
+    try:
+        with accelerator.join_uneven_inputs([policy], even_batches=False), torch.no_grad():
+            for batch in dataloader:
+                batch = preprocessor(batch)
+                batch_size = _infer_batch_size(batch)
+                batch_weight = torch.tensor(float(batch_size), device=accelerator.device, dtype=torch.float64)
 
-            with accelerator.autocast():
-                loss, output_dict = policy.forward(batch)
+                with accelerator.autocast():
+                    loss, output_dict = policy.forward(batch)
 
-            total_loss += loss.detach().to(torch.float64) * batch_weight
-            total_weight += batch_weight
+                total_loss += loss.detach().to(torch.float64) * batch_weight
+                total_weight += batch_weight
 
-            for key, value in _extract_scalar_metrics(output_dict).items():
-                if key == "loss":
-                    continue
-                if key not in metric_sums:
-                    metric_sums[key] = torch.zeros((), device=accelerator.device, dtype=torch.float64)
-                metric_sums[key] += torch.tensor(value, device=accelerator.device, dtype=torch.float64) * batch_weight
+                for key, value in _extract_scalar_metrics(output_dict).items():
+                    if key == "loss":
+                        continue
+                    if key not in metric_sums:
+                        metric_sums[key] = torch.zeros((), device=accelerator.device, dtype=torch.float64)
+                    metric_sums[key] += torch.tensor(
+                        value, device=accelerator.device, dtype=torch.float64
+                    ) * batch_weight
 
-    total_loss = accelerator.reduce(total_loss, reduction="sum")
-    total_weight = accelerator.reduce(total_weight, reduction="sum")
+        total_loss = accelerator.reduce(total_loss, reduction="sum")
+        total_weight = accelerator.reduce(total_weight, reduction="sum")
 
-    if total_weight.item() == 0:
-        results = {"val/loss": float("nan"), "val/num_samples": 0.0}
-    else:
-        results = {
-            "val/loss": (total_loss / total_weight).item(),
-            "val/num_samples": total_weight.item(),
-        }
-        for key, value in metric_sums.items():
-            reduced_value = accelerator.reduce(value, reduction="sum")
-            results[f"val/{key}"] = (reduced_value / total_weight).item()
-
-    accelerator.wait_for_everyone()
-    if was_training:
-        policy.train()
+        if total_weight.item() == 0:
+            results = {"val/loss": float("nan"), "val/num_samples": 0.0}
+        else:
+            results = {
+                "val/loss": (total_loss / total_weight).item(),
+                "val/num_samples": total_weight.item(),
+            }
+            for key, value in metric_sums.items():
+                reduced_value = accelerator.reduce(value, reduction="sum")
+                results[f"val/{key}"] = (reduced_value / total_weight).item()
+    finally:
+        accelerator.wait_for_everyone()
+        if was_training:
+            policy.train()
+        for step, step_was_training in reversed(preprocessor_step_modes):
+            step.train(step_was_training)
 
     if accelerator.is_main_process:
         results["val/eval_s"] = time.perf_counter() - start_time
@@ -371,6 +396,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+    preprocessor = disable_runtime_spatial_preprocess(preprocessor, cfg)
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -676,7 +702,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
             else:
                 unwrapped_policy.push_model_to_hub(cfg)
-            preprocessor.push_to_hub(cfg.policy.repo_id)
+            saved_preprocessor = build_saved_inference_preprocessor(preprocessor, cfg)
+            saved_preprocessor.push_to_hub(cfg.policy.repo_id)
             postprocessor.push_to_hub(cfg.policy.repo_id)
 
     # Properly clean up the distributed process group

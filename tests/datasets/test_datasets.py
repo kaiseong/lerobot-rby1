@@ -27,7 +27,7 @@ from PIL import Image
 from safetensors.torch import load_file
 
 import lerobot
-from lerobot.configs.default import DatasetConfig, DatasetCropConfig, DatasetSourceConfig
+from lerobot.configs.default import DatasetConfig, DatasetCropConfig, DatasetResizePadConfig, DatasetSourceConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset, make_train_val_datasets
 from lerobot.datasets.image_writer import image_array_to_pil_image
@@ -1768,6 +1768,36 @@ def test_make_dataset_with_crop_requires_all_camera_params(mismatched_camera_dat
         make_dataset(cfg)
 
 
+def test_make_dataset_with_resize_pad_creates_and_reuses_processed_dataset(mismatched_camera_dataset):
+    resize_pad_cfg = DatasetResizePadConfig(enable=True, resize_size=(32, 32))
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(mismatched_camera_dataset.root),
+            resize_pad=resize_pad_cfg,
+        ),
+        policy=make_policy_config("act"),
+    )
+
+    dataset = make_dataset(cfg)
+    item = dataset[0]
+
+    assert dataset.root != mismatched_camera_dataset.root
+    assert tuple(dataset.meta.features[f"{OBS_IMAGES}.front"]["shape"]) == (32, 32, 3)
+    assert tuple(dataset.meta.features[f"{OBS_IMAGES}.right"]["shape"]) == (32, 32, 3)
+    assert item[f"{OBS_IMAGES}.front"].shape == (3, 32, 32)
+    assert item[f"{OBS_IMAGES}.right"].shape == (3, 32, 32)
+    assert torch.all(item[f"{OBS_IMAGES}.front"][:, 0, :] == 0)
+    assert torch.all(item[f"{OBS_IMAGES}.right"][:, :, 0] == 0)
+    assert (dataset.root / "meta" / "resize_pad_params.json").exists()
+
+    with patch("lerobot.datasets.factory.convert_lerobot_dataset_to_resized_padded_lerobot_dataset") as convert_mock:
+        reused_dataset = make_dataset(cfg)
+
+    convert_mock.assert_not_called()
+    assert reused_dataset.root == dataset.root
+
+
 def test_groot_pack_accepts_cropped_training_dataset(mismatched_camera_dataset):
     pack_inputs = GrootPackInputsStep()
     with pytest.raises(ValueError, match="all input arrays must have the same shape"):
@@ -1862,6 +1892,66 @@ def test_make_train_val_datasets_with_crop_reuses_processed_root(mismatched_came
     assert train_dataset.root == val_dataset.root
     assert train_dataset.root != mismatched_camera_dataset.root
     assert set(train_dataset.episodes).isdisjoint(set(val_dataset.episodes))
+
+
+def test_make_train_val_datasets_uses_train_only_stats_for_validation_split(
+    tmp_path, empty_lerobot_dataset_factory
+):
+    features = {
+        ACTION: {"dtype": "float32", "shape": (2,), "names": None},
+        OBS_STATE: {"dtype": "float32", "shape": (4,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "val_split_stats", features=features, fps=10)
+
+    for ep_idx in range(4):
+        for _ in range(3):
+            dataset.add_frame(
+                {
+                    ACTION: np.full((2,), ep_idx * 10, dtype=np.float32),
+                    OBS_STATE: np.full((4,), ep_idx * 100, dtype=np.float32),
+                    "task": f"task_{ep_idx}",
+                }
+            )
+        dataset.save_episode()
+    dataset.finalize()
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(dataset.root),
+            episodes=[0, 1, 2, 3],
+            val_ratio=0.25,
+            use_imagenet_stats=False,
+        ),
+        policy=make_policy_config("act"),
+        seed=123,
+    )
+
+    train_dataset, val_dataset = make_train_val_datasets(cfg)
+
+    assert val_dataset is not None
+
+    expected_action_mean = np.full(
+        (2,), np.mean([episode_idx * 10 for episode_idx in train_dataset.episodes]), dtype=np.float32
+    )
+    expected_state_mean = np.full(
+        (4,), np.mean([episode_idx * 100 for episode_idx in train_dataset.episodes]), dtype=np.float32
+    )
+
+    np.testing.assert_allclose(train_dataset.meta.stats[ACTION]["mean"], expected_action_mean)
+    np.testing.assert_allclose(train_dataset.meta.stats[OBS_STATE]["mean"], expected_state_mean)
+    np.testing.assert_allclose(val_dataset.meta.stats[ACTION]["mean"], expected_action_mean)
+    np.testing.assert_allclose(val_dataset.meta.stats[OBS_STATE]["mean"], expected_state_mean)
+    np.testing.assert_allclose(train_dataset.meta.stats[ACTION]["count"], np.array([9]))
+
+
+def test_dataset_config_rejects_crop_and_resize_pad_together():
+    with pytest.raises(ValueError, match="cannot be enabled at the same time"):
+        DatasetConfig(
+            repo_id="dummy/repo",
+            crop=DatasetCropConfig(enable=True, resize_size=(32, 32), params={"observation.images.front": (0, 0, 32, 32)}),
+            resize_pad=DatasetResizePadConfig(enable=True, resize_size=(32, 32)),
+        )
 
 
 def test_dataset_config_rejects_validation_with_sources():

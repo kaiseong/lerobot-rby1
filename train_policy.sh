@@ -33,13 +33,21 @@ Examples:
     --dataset rainbowrobotics/bin_0318_19_merged_v2 \
     --enable-crop \
     --crop-resize-size "[480,480]" \
-    --crop-params '{"observation.images.front":[0,80,480,480],"observation.images.right":[160,0,480,480]}'
+    --crop-params '{"observation.images.front":[0,80,480,480],"observation.images.right":[160,0,480,480]}' \
+    --batch-size 16
 
   ./train_policy.sh \
     --policy pi05 \
     --dataset rainbowrobotics/bin_0318_19_merged_v2 \
     --policy-path your/pi05_checkpoint_or_repo \
     --val-ratio 0.1
+
+  ./train_policy.sh \
+    --policy pi05 \
+    --dataset rainbowrobotics/bin_0318_19_merged_v2 \
+    --policy-path your/pi05_checkpoint_or_repo \
+    --enable-resize-pad \
+    --resize-pad-size "[224,224]"
 
 Common options:
   --policy POLICY_TYPE
@@ -63,6 +71,8 @@ Common options:
   --enable-crop
   --crop-resize-size "[H,W]"
   --crop-params JSON
+  --enable-resize-pad
+  --resize-pad-size "[H,W]"
   --num-processes N
   --mixed-precision MODE
   --help
@@ -106,6 +116,8 @@ WANDB_ENTITY=""
 ENABLE_CROP=false
 CROP_RESIZE_SIZE="[480,480]"
 CROP_PARAMS='{"observation.images.front":[0,80,480,480],"observation.images.right":[160,0,480,480]}'
+ENABLE_RESIZE_PAD=false
+RESIZE_PAD_SIZE="[224,224]"
 
 NUM_PROCESSES=""
 MIXED_PRECISION=""
@@ -198,6 +210,14 @@ while [[ $# -gt 0 ]]; do
       CROP_PARAMS="${2:-}"
       shift 2
       ;;
+    --enable-resize-pad)
+      ENABLE_RESIZE_PAD=true
+      shift
+      ;;
+    --resize-pad-size)
+      RESIZE_PAD_SIZE="${2:-}"
+      shift 2
+      ;;
     --num-processes)
       NUM_PROCESSES="${2:-}"
       shift 2
@@ -232,6 +252,11 @@ fi
 if [[ -z "${DATASET_REPO_ID}" ]]; then
   echo "--dataset is required" >&2
   usage
+  exit 1
+fi
+
+if [[ "${ENABLE_CROP}" == "true" && "${ENABLE_RESIZE_PAD}" == "true" ]]; then
+  echo "--enable-crop and --enable-resize-pad cannot be used together" >&2
   exit 1
 fi
 
@@ -317,6 +342,13 @@ if [[ "${ENABLE_CROP}" == "true" ]]; then
     --dataset.crop.enable=true
     --dataset.crop.resize_size="${CROP_RESIZE_SIZE}"
     --dataset.crop.params="${CROP_PARAMS}"
+  )
+fi
+
+if [[ "${ENABLE_RESIZE_PAD}" == "true" ]]; then
+  TRAIN_CMD+=(
+    --dataset.resize_pad.enable=true
+    --dataset.resize_pad.resize_size="${RESIZE_PAD_SIZE}"
   )
 fi
 

@@ -246,9 +246,10 @@ def make_pre_post_processors(
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
             # Need to override both stats AND normalize_min_max since saved config might be empty
-            preprocessor_overrides = {}
-            postprocessor_overrides = {}
+            preprocessor_overrides = dict(kwargs.get("preprocessor_overrides", {}) or {})
+            postprocessor_overrides = dict(kwargs.get("postprocessor_overrides", {}) or {})
             preprocessor_overrides["groot_pack_inputs_v3"] = {
+                **preprocessor_overrides.get("groot_pack_inputs_v3", {}),
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
             }
@@ -256,6 +257,7 @@ def make_pre_post_processors(
             # Also ensure postprocessing slices to env action dim and unnormalizes with dataset stats
             env_action_dim = policy_cfg.output_features[ACTION].shape[0]
             postprocessor_overrides["groot_action_unpack_unnormalize_v1"] = {
+                **postprocessor_overrides.get("groot_action_unpack_unnormalize_v1", {}),
                 "stats": kwargs.get("dataset_stats"),
                 "normalize_min_max": True,
                 "env_action_dim": env_action_dim,

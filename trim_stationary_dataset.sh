@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-REPO_ID="rainbowrobotics/bin_0318_19_merged"
+REPO_ID="rainbowrobotics/bin_0318_20_merged"
 NEW_REPO_ID="kaiseong/bin_0318-19_merged_trim_0.2"
 PUSH_TO_HUB="true"
 KEEP_START_SECONDS="0.2"
 KEEP_END_SECONDS="0.2"
 STATE_KEY="observation.state"
-STATE_EPSILON="0.009"
+STATE_EPSILON="0.01"
 
 usage() {
   cat <<EOF

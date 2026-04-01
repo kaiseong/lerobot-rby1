@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/kgs/lerobot_rby1
 
-OUTPUT_REPO_ID="${OUTPUT_REPO_ID:-rainbowrobotics/compare_18-20_merged}"
-SRC_A="${SRC_A:-rainbowrobotics/bin_0318-20_merged}"
+OUTPUT_REPO_ID="${OUTPUT_REPO_ID:-rainbowrobotics/compare_18-19_terminate_merge}"
+SRC_A="${SRC_A:-kaiseong/bin_0318-19_merged_trim_0.2}"
 SRC_B="${SRC_B:-rainbowrobotics/bin_terminate_}"
 SRC_REPO_IDS="${SRC_REPO_IDS:-}"
 ROOT="${ROOT:-}"

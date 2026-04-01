@@ -119,6 +119,7 @@ class RobotClient:
                 lerobot_features,
                 config.actions_per_chunk,
                 config.policy_device,
+                client_image_crop_applied=bool(config.image_crop_params),
             )
             self.channel = grpc.insecure_channel(
                 self.server_address,
@@ -130,6 +131,7 @@ class RobotClient:
             validate_groot_robot_compatibility(
                 self.robot,
                 front_camera_key=self.config.groot_front_camera_key,
+                left_wrist_camera_key=self.config.groot_left_wrist_camera_key,
                 right_wrist_camera_key=self.config.groot_right_wrist_camera_key,
             )
             self.logger.info(f"Initializing GR00T ZMQ client to connect to server at {self.server_address}")
@@ -485,6 +487,7 @@ class RobotClient:
             groot_observation = build_groot_n16_observation(
                 raw_observation,
                 front_camera_key=self.config.groot_front_camera_key,
+                left_wrist_camera_key=self.config.groot_left_wrist_camera_key,
                 right_wrist_camera_key=self.config.groot_right_wrist_camera_key,
                 image_size=self.config.groot_image_size,
             )

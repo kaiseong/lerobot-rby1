@@ -252,6 +252,30 @@ def test_robot_client_config_normalizes_image_crop_params():
     assert cfg.to_dict()["image_crop_params"] == {"front": (0, 80, 480, 480)}
 
 
+def test_robot_client_sends_client_crop_flag_to_grpc_server():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    client = RobotClient(
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            image_crop_params={"front": [0, 80, 480, 480]},
+        )
+    )
+
+    try:
+        assert client.policy_config is not None
+        assert client.policy_config.client_image_crop_applied is True
+    finally:
+        if client.robot.is_connected:
+            client.stop()
+
+
 def test_control_loop_observation_applies_client_side_crops(robot_client, monkeypatch):
     """Observations should be cropped on the client before serialization."""
     front = np.arange(480 * 640 * 3, dtype=np.uint8).reshape(480, 640, 3)

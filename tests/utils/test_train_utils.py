@@ -17,6 +17,8 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from lerobot.configs.default import DatasetConfig, DatasetCropConfig, DatasetResizePadConfig
+from lerobot.processor import IdentityProcessorStep, PolicyProcessorPipeline
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
     LAST_CHECKPOINT_LINK,
@@ -28,8 +30,10 @@ from lerobot.utils.constants import (
     TRAINING_STEP,
 )
 from lerobot.utils.train_utils import (
+    build_saved_inference_preprocessor,
     get_step_checkpoint_dir,
     get_step_identifier,
+    get_training_spatial_preprocess_override,
     load_training_state,
     load_training_step,
     save_checkpoint,
@@ -94,6 +98,65 @@ def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     cfg.save_pretrained.assert_called_once()
     policy.config.save_pretrained.assert_called_once()
     mock_save_training_state.assert_called_once()
+
+
+@patch("lerobot.utils.train_utils.save_training_state")
+def test_save_checkpoint_injects_saved_crop_preprocessor(mock_save_training_state, tmp_path, optimizer):
+    policy = Mock()
+    cfg = Mock()
+    cfg.peft = None
+    cfg.dataset = DatasetConfig(
+        repo_id="dummy/repo",
+        crop=DatasetCropConfig(
+            enable=True,
+            resize_size=(32, 32),
+            params={"observation.images.front": (1, 2, 30, 30)},
+        ),
+    )
+    preprocessor = PolicyProcessorPipeline(steps=[IdentityProcessorStep()], name="policy_preprocessor")
+
+    save_checkpoint(tmp_path, 10, cfg, policy, optimizer, preprocessor=preprocessor)
+
+    saved = PolicyProcessorPipeline.from_pretrained(
+        tmp_path / "pretrained_model", config_filename="policy_preprocessor.json"
+    )
+    first_step = saved.steps[0]
+
+    assert getattr(first_step.__class__, "_registry_name", None) == "observation_image_spatial_preprocess"
+    assert first_step.get_config()["mode"] == "crop"
+    assert first_step.get_config()["resize_size"] == (32, 32)
+    assert first_step.get_config()["crop_params_dict"] == {"observation.images.front": (1, 2, 30, 30)}
+    mock_save_training_state.assert_called_once()
+
+
+def test_build_saved_inference_preprocessor_injects_resize_pad():
+    cfg = Mock()
+    cfg.dataset = DatasetConfig(
+        repo_id="dummy/repo",
+        resize_pad=DatasetResizePadConfig(enable=True, resize_size=(224, 224)),
+    )
+    preprocessor = PolicyProcessorPipeline(steps=[IdentityProcessorStep()], name="policy_preprocessor")
+
+    saved_preprocessor = build_saved_inference_preprocessor(preprocessor, cfg)
+
+    assert getattr(saved_preprocessor.steps[0].__class__, "_registry_name", None) == "observation_image_spatial_preprocess"
+    assert saved_preprocessor.steps[0].get_config()["mode"] == "resize_pad"
+
+
+def test_get_training_spatial_preprocess_override_disables_saved_step():
+    cfg = Mock()
+    cfg.dataset = DatasetConfig(
+        repo_id="dummy/repo",
+        crop=DatasetCropConfig(
+            enable=True,
+            resize_size=(32, 32),
+            params={"observation.images.front": (1, 2, 30, 30)},
+        ),
+    )
+
+    overrides = get_training_spatial_preprocess_override(cfg)
+
+    assert overrides == {"observation_image_spatial_preprocess": {"mode": "none"}}
 
 
 def test_save_training_state(tmp_path, optimizer, scheduler):
