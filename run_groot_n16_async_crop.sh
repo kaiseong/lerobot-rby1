@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/kgs/lerobot_rby1
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 
 SERVER_ADDRESS="${SERVER_ADDRESS:-192.168.0.3:5555}"
 ROBOT_ADDRESS="${ROBOT_ADDRESS:-192.168.0.10:50051}"
@@ -19,7 +20,7 @@ GROOT_IMAGE_SIZE="${GROOT_IMAGE_SIZE:-[480,640]}"
 
 IMAGE_CROP_PARAMS="${IMAGE_CROP_PARAMS:-{}}"
 
-PYTHONPATH=src python -m lerobot.async_inference.robot_client \
+PYTHONPATH="${SCRIPT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}" python -m lerobot.async_inference.robot_client \
   --backend=groot_n16_zmq \
   --server_address="${SERVER_ADDRESS}" \
   --robot.type=rby1 \
