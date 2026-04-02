@@ -62,6 +62,10 @@ from .helpers import (
     raw_observation_to_observation,
 )
 
+# RTC action chunk: carries both original and processed actions so the client
+# can feed original actions back as prev_chunk_left_over for the next inference.
+RTCActionChunk = dict  # {"timed_actions": list[TimedAction], "original_actions": Tensor | None}
+
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
@@ -169,6 +173,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         end = time.perf_counter()
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+
+        # Configure RTC if enabled on the server
+        if self.config.rtc.enabled:
+            self.policy.config.rtc_config = self.config.rtc
+            self.policy.init_rtc_processor()
+            self.logger.info(
+                f"RTC enabled: execution_horizon={self.config.rtc.execution_horizon}, "
+                f"max_guidance_weight={self.config.rtc.max_guidance_weight}"
+            )
 
         return services_pb2.Empty()
 
@@ -311,19 +324,43 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        original_actions: list[torch.Tensor | None] | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
+        if original_actions is None:
+            original_actions = [None] * len(action_chunk)
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
-            for i, action in enumerate(action_chunk)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt,
+                timestep=i_0 + i,
+                action=action,
+                original_action=orig,
+            )
+            for i, (action, orig) in enumerate(zip(action_chunk, original_actions))
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        inference_delay: int | None = None,
+        prev_chunk_left_over: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Get an action chunk from the policy, optionally with RTC parameters."""
+        kwargs = {}
+        if self.config.rtc.enabled and inference_delay is not None:
+            kwargs["inference_delay"] = inference_delay
+        if self.config.rtc.enabled and prev_chunk_left_over is not None:
+            kwargs["prev_chunk_left_over"] = prev_chunk_left_over
+
+        chunk = self.policy.predict_action_chunk(observation, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -354,15 +391,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
-        """3. Get action chunk"""
+        """3. Get action chunk (with RTC params if available)"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        # Extract RTC parameters from the observation if provided by the client
+        inference_delay = observation_t.inference_delay
+        prev_chunk_left_over = observation_t.prev_chunk_left_over
+        if prev_chunk_left_over is not None:
+            prev_chunk_left_over = prev_chunk_left_over.to(self.device)
+
+        action_tensor = self._get_action_chunk(
+            observation,
+            inference_delay=inference_delay,
+            prev_chunk_left_over=prev_chunk_left_over,
+        )
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
         """4. Apply postprocessor"""
+        # Store original actions (before postprocessing) for RTC prefix tracking
+        original_actions_tensor = action_tensor.squeeze(0).clone().detach().cpu() if self.config.rtc.enabled else None
+
         # Apply postprocessor (handles unnormalization and device movement)
         # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
         # So we process each action in the chunk individually
@@ -383,9 +433,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         action_tensor = action_tensor.detach().cpu()
 
-        """5. Convert to TimedAction list"""
+        """5. Convert to TimedAction list (with original actions for RTC)"""
+        action_list = list(action_tensor)
+        original_action_list = list(original_actions_tensor) if original_actions_tensor is not None else [None] * len(action_list)
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(), action_list, observation_t.get_timestep(),
+            original_actions=original_action_list,
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess

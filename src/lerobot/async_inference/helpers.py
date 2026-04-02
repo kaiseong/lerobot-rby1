@@ -220,6 +220,8 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    # RTC: original (pre-postprocessed) action for computing leftovers
+    original_action: Action | None = None
 
     def get_action(self):
         return self.action
@@ -229,6 +231,10 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    # RTC: leftover original actions from previous chunk (for prefix attention)
+    prev_chunk_left_over: torch.Tensor | None = None
+    # RTC: inference delay in timesteps (accounts for network + compute latency)
+    inference_delay: int | None = None
 
     def get_observation(self):
         return self.observation

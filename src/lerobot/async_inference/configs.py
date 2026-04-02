@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from lerobot.configs.types import RTCAttentionSchedule
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.robots.config import RobotConfig
 
 from .constants import (
@@ -62,6 +64,17 @@ class PolicyServerConfig:
 
     obs_queue_timeout: float = field(
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
+    )
+
+    # RTC configuration
+    rtc: RTCConfig = field(
+        default_factory=lambda: RTCConfig(
+            enabled=False,
+            execution_horizon=10,
+            max_guidance_weight=1.0,
+            prefix_attention_schedule=RTCAttentionSchedule.EXP,
+        ),
+        metadata={"help": "RTC configuration for prefix-guided action chunking"},
     )
 
     def __post_init__(self):
@@ -146,6 +159,23 @@ class RobotClientConfig:
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
+    )
+
+    # RTC configuration
+    rtc: RTCConfig = field(
+        default_factory=lambda: RTCConfig(
+            enabled=False,
+            execution_horizon=10,
+            max_guidance_weight=1.0,
+            prefix_attention_schedule=RTCAttentionSchedule.EXP,
+        ),
+        metadata={"help": "RTC configuration for prefix-guided action chunking"},
+    )
+
+    # RTC: threshold for requesting new actions (in number of remaining actions)
+    action_queue_size_to_get_new_actions: int = field(
+        default=30,
+        metadata={"help": "Request new actions when queue drops to this size (RTC mode)"},
     )
 
     @property
