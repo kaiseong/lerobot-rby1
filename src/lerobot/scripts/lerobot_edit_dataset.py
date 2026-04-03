@@ -66,6 +66,13 @@ Remove camera feature:
         --operation.type remove_feature \
         --operation.feature_names "['observation.images.top']"
 
+Recompute exact dataset-level stats for state/action and save to a new dataset:
+    lerobot-edit-dataset \
+        --repo_id rainbowrobotics/simtos_sort_30_31_merged_notorso \
+        --operation.type recompute_exact_stats \
+        --operation.feature_names "['observation.state', 'action']" \
+        --new_repo_id rainbowrobotics/simtos_sort_30_31_merged_notorso_qfixed
+
 Modify tasks - set a single task for all episodes (WARNING: modifies in-place):
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -156,6 +163,7 @@ from lerobot.datasets.dataset_tools import (
     delete_episodes,
     merge_datasets,
     modify_tasks,
+    recompute_exact_stats,
     remove_feature,
     split_dataset,
     trim_episode_edges,
@@ -210,6 +218,12 @@ class MergeConfig(OperationConfig):
 @OperationConfig.register_subclass("remove_feature")
 @dataclass
 class RemoveFeatureConfig(OperationConfig):
+    feature_names: list[str] | None = None
+
+
+@OperationConfig.register_subclass("recompute_exact_stats")
+@dataclass
+class RecomputeExactStatsConfig(OperationConfig):
     feature_names: list[str] | None = None
 
 
@@ -458,6 +472,40 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
 
 
+def handle_recompute_exact_stats(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, RecomputeExactStatsConfig):
+        raise ValueError("Operation config must be RecomputeExactStatsConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+
+    logging.info(f"Recomputing exact stats for {cfg.repo_id}")
+    if cfg.operation.feature_names:
+        logging.info(f"Selected features: {cfg.operation.feature_names}")
+    else:
+        logging.info("Selected features: all parquet-backed numeric features")
+
+    new_dataset = recompute_exact_stats(
+        dataset,
+        feature_names=cfg.operation.feature_names,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+    )
+
+    logging.info(f"Dataset saved to {output_dir}")
+    logging.info(f"Recomputed stats for: {cfg.operation.feature_names or 'all parquet-backed numeric features'}")
+    logging.info(f"Episodes: {new_dataset.meta.total_episodes}, Frames: {new_dataset.meta.total_frames}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
 def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, ModifyTasksConfig):
         raise ValueError("Operation config must be ModifyTasksConfig")
@@ -622,6 +670,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "recompute_exact_stats":
+        handle_recompute_exact_stats(cfg)
     elif operation_type == "modify_tasks":
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":

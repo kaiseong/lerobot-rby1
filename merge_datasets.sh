@@ -2,9 +2,9 @@
 set -euo pipefail
 
 
-OUTPUT_REPO_ID="${OUTPUT_REPO_ID:-rainbowrobotics/compare_18-19_terminate_merge}"
-SRC_A="${SRC_A:-kaiseong/bin_0318-19_merged_trim_0.2}"
-SRC_B="${SRC_B:-rainbowrobotics/bin_terminate_}"
+OUTPUT_REPO_ID="${OUTPUT_REPO_ID:-rainbowrobotics/simtos_0402_merge}"
+SRC_A="${SRC_A:-rainbowrobotics/simtos_final_one_item_can_rotate}"
+SRC_B="${SRC_B:-rainbowrobotics/simtos_final_one_item_can}"
 SRC_REPO_IDS="${SRC_REPO_IDS:-}"
 ROOT="${ROOT:-}"
 PUSH_TO_HUB="${PUSH_TO_HUB:-true}"

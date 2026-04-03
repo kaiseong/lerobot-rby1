@@ -708,6 +708,122 @@ def remove_feature(
     )
 
 
+def _resolve_exact_stats_feature_names(
+    dataset: LeRobotDataset,
+    feature_names: list[str] | None = None,
+) -> list[str]:
+    """Resolve parquet-backed numeric feature names for exact stats recomputation."""
+    parquet_files = sorted((dataset.root / DATA_DIR).glob("*/*.parquet"))
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in {dataset.root / DATA_DIR}")
+
+    parquet_columns = set(pq.read_schema(parquet_files[0]).names)
+
+    if feature_names is None:
+        feature_names = [
+            name
+            for name, feature in dataset.meta.features.items()
+            if name in parquet_columns and feature["dtype"] not in {"image", "video"}
+        ]
+
+    if not feature_names:
+        raise ValueError("No parquet-backed numeric features selected for exact stats recomputation")
+
+    invalid = [name for name in feature_names if name not in dataset.meta.features]
+    if invalid:
+        raise ValueError(f"Unknown feature names: {invalid}")
+
+    missing_from_parquet = [name for name in feature_names if name not in parquet_columns]
+    if missing_from_parquet:
+        raise ValueError(f"Features are not stored in data parquet files: {missing_from_parquet}")
+
+    unsupported = [
+        name for name in feature_names if dataset.meta.features[name]["dtype"] in {"image", "video"}
+    ]
+    if unsupported:
+        raise ValueError(f"Exact stats recomputation does not support visual features: {unsupported}")
+
+    return feature_names
+
+
+def _load_feature_array_from_parquet(
+    parquet_files: list[Path],
+    feature_name: str,
+    feature_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Load a parquet-backed feature into a single numpy array shaped as [N, *feature_shape]."""
+    chunks: list[np.ndarray] = []
+
+    for src_path in tqdm(parquet_files, desc=f"Loading {feature_name}"):
+        values = pq.read_table(src_path, columns=[feature_name]).column(0).to_pylist()
+        if not values:
+            continue
+
+        arr = np.asarray(values)
+        arr = arr.reshape(len(values), *feature_shape)
+        if not np.issubdtype(arr.dtype, np.number):
+            raise TypeError(f"Feature '{feature_name}' is not numeric and cannot be recomputed exactly")
+        chunks.append(arr.astype(np.float64, copy=False))
+
+    if not chunks:
+        raise ValueError(f"Feature '{feature_name}' has no values in data parquet files")
+
+    return np.concatenate(chunks, axis=0)
+
+
+def _compute_exact_feature_stats(feature_array: np.ndarray) -> dict[str, np.ndarray]:
+    """Compute exact dataset-level stats for a numeric feature array."""
+    return {
+        "min": np.min(feature_array, axis=0),
+        "max": np.max(feature_array, axis=0),
+        "mean": np.mean(feature_array, axis=0),
+        "std": np.std(feature_array, axis=0),
+        "count": np.array([feature_array.shape[0]], dtype=np.int64),
+        "q01": np.quantile(feature_array, 0.01, axis=0),
+        "q10": np.quantile(feature_array, 0.10, axis=0),
+        "q50": np.quantile(feature_array, 0.50, axis=0),
+        "q90": np.quantile(feature_array, 0.90, axis=0),
+        "q99": np.quantile(feature_array, 0.99, axis=0),
+    }
+
+
+def recompute_exact_stats(
+    dataset: LeRobotDataset,
+    feature_names: list[str] | None = None,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Create a dataset copy with exact dataset-level stats recomputed from data parquet files.
+
+    This recomputes statistics directly over all frames for selected parquet-backed numeric features.
+    It is useful when dataset-level quantiles must reflect the full frame distribution exactly rather
+    than an aggregation of episode-level quantiles.
+    """
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_stats_refreshed"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    feature_names = _resolve_exact_stats_feature_names(dataset, feature_names)
+    parquet_files = sorted((dataset.root / DATA_DIR).glob("*/*.parquet"))
+
+    logging.info(f"Copying dataset from {dataset.root} to {output_dir}")
+    shutil.copytree(dataset.root, output_dir)
+
+    new_stats = dict(dataset.meta.stats) if dataset.meta.stats is not None else {}
+    for feature_name in feature_names:
+        feature_shape = tuple(dataset.meta.features[feature_name]["shape"])
+        feature_array = _load_feature_array_from_parquet(parquet_files, feature_name, feature_shape)
+        new_stats[feature_name] = _compute_exact_feature_stats(feature_array)
+
+    write_stats(new_stats, output_dir)
+
+    return LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+    )
+
+
 def _fractions_to_episode_indices(
     total_episodes: int,
     splits: dict[str, float],

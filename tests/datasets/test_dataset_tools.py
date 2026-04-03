@@ -18,6 +18,7 @@
 from unittest.mock import patch
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -27,6 +28,7 @@ from lerobot.datasets.dataset_tools import (
     merge_datasets,
     modify_features,
     modify_tasks,
+    recompute_exact_stats,
     remove_feature,
     split_dataset,
     trim_episode_edges,
@@ -1268,6 +1270,55 @@ def test_remove_feature_updates_stats(sample_dataset, tmp_path):
 
     if dataset_without_reward.meta.stats:
         assert "reward" not in dataset_without_reward.meta.stats
+
+
+def test_recompute_exact_stats_updates_selected_features(sample_dataset, tmp_path):
+    output_dir = tmp_path / "exact_stats"
+
+    exact_dataset = recompute_exact_stats(
+        sample_dataset,
+        feature_names=["action", "observation.state"],
+        output_dir=output_dir,
+        repo_id="exact_stats",
+    )
+
+    parquet_files = sorted((sample_dataset.root / "data").glob("*/*.parquet"))
+    source_table = pq.read_table(parquet_files, columns=["action", "observation.state"]).to_pydict()
+    expected_action = np.asarray(source_table["action"], dtype=np.float64)
+    expected_state = np.asarray(source_table["observation.state"], dtype=np.float64)
+
+    np.testing.assert_allclose(
+        exact_dataset.meta.stats["action"]["q01"],
+        np.quantile(expected_action, 0.01, axis=0),
+    )
+    np.testing.assert_allclose(
+        exact_dataset.meta.stats["action"]["q99"],
+        np.quantile(expected_action, 0.99, axis=0),
+    )
+    np.testing.assert_allclose(
+        exact_dataset.meta.stats["observation.state"]["q01"],
+        np.quantile(expected_state, 0.01, axis=0),
+    )
+    np.testing.assert_allclose(
+        exact_dataset.meta.stats["observation.state"]["q99"],
+        np.quantile(expected_state, 0.99, axis=0),
+    )
+    np.testing.assert_allclose(
+        exact_dataset.meta.stats["observation.images.top"]["q01"],
+        sample_dataset.meta.stats["observation.images.top"]["q01"],
+    )
+    assert exact_dataset.meta.total_frames == sample_dataset.meta.total_frames
+    assert exact_dataset.meta.total_episodes == sample_dataset.meta.total_episodes
+
+
+def test_recompute_exact_stats_rejects_visual_features(sample_dataset, tmp_path):
+    with pytest.raises(ValueError, match="does not support visual features"):
+        recompute_exact_stats(
+            sample_dataset,
+            feature_names=["observation.images.top"],
+            output_dir=tmp_path / "bad_stats",
+            repo_id="bad_stats",
+        )
 
 
 def test_delete_consecutive_episodes(sample_dataset, tmp_path):
