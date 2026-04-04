@@ -39,7 +39,7 @@ class Rby1LeaderArmConfig(TeleoperatorConfig):
     # ── Initialisation trajectory ─────────────────────────────────────
     # Duration (seconds) for the smooth cosine interpolation from the
     # current leader arm pose to the init pose on connect().
-    init_duration: float = 2.0
+    init_duration: float = 5.0
 
     # Init (ready) pose for each side in degrees.
     # Matches the robot ready pose defined in rby1_vr.py and rby1.py so that

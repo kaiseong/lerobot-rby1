@@ -121,3 +121,39 @@ def test_record_and_replay(tmp_path):
         mock_get_safe_version.return_value = "v3.0"
         mock_snapshot_download.return_value = str(tmp_path / "record_and_replay")
         replay(replay_cfg)
+
+
+def test_record_calls_robot_and_teleop_reset_between_episodes(tmp_path):
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "record_with_reset",
+        num_episodes=2,
+        episode_time_s=0.05,
+        reset_time_s=0.05,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=robot_cfg,
+        dataset=dataset_cfg,
+        teleop=teleop_cfg,
+        play_sounds=False,
+    )
+
+    reset_calls = {"robot": 0, "teleop": 0}
+
+    def _mock_robot_reset(self):
+        reset_calls["robot"] += 1
+
+    def _mock_teleop_reset(self):
+        reset_calls["teleop"] += 1
+
+    with (
+        patch("tests.mocks.mock_robot.MockRobot.reset", _mock_robot_reset, create=True),
+        patch("tests.mocks.mock_teleop.MockTeleop.reset", _mock_teleop_reset, create=True),
+    ):
+        record(cfg)
+
+    assert reset_calls == {"robot": 1, "teleop": 1}

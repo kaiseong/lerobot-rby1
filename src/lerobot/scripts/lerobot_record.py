@@ -549,16 +549,22 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                 )
 
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
+                # Execute a few seconds without recording to give time to manually reset the environment.
+                # If available, call robot/teleop reset hooks once before entering the reset loop.
+                # Skip reset for the last episode to be recorded.
                 if not events["stop_recording"] and (
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
-                    # reset g1 robot
-                    if robot.name == "unitree_g1":
-                        robot.reset()
+                    robot_reset = getattr(robot, "reset", None)
+                    if callable(robot_reset):
+                        robot_reset()
+
+                    if isinstance(teleop, Teleoperator):
+                        teleop_reset = getattr(teleop, "reset", None)
+                        if callable(teleop_reset):
+                            teleop_reset()
 
                     record_loop(
                         robot=robot,
