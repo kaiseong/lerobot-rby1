@@ -93,18 +93,19 @@ from lerobot.async_inference.helpers import (
 )
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs.types import RTCAttentionSchedule
-from lerobot.policies.rtc.action_queue import ActionQueue
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.policies.rtc.latency_tracker import LatencyTracker
+from lerobot.policies.rtc import ActionInterpolator, ActionQueue, LatencyTracker, RTCConfig
 from lerobot.processor.factory import make_default_robot_action_processor
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_openarm_follower,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
     so_follower,
+    unitree_g1,
 )
 from lerobot.transport import (
     services_pb2,  # type: ignore
@@ -123,6 +124,7 @@ class RTCAsyncClientConfig(RobotClientConfig):
 
     # Demo parameters
     duration: float = field(default=60.0, metadata={"help": "Duration to run the demo (seconds)"})
+    interpolation_multiplier: int = field(default=1, metadata={"help": "Control rate multiplier (1=off, 2=2x, 3=3x)"})
 
     # RTC is inherited from RobotClientConfig.rtc
 
@@ -380,18 +382,24 @@ class RTCAsyncClient:
         self.start_barrier.wait()
         logger.info("[ACTOR] Starting actor control thread")
 
+        action_keys = [k for k in self.robot.action_features if k.endswith(".pos")]
+
         action_count = 0
-        action_interval = 1.0 / self.config.fps
-        action_keys = list(self.robot.action_features)
+        interpolator = ActionInterpolator(multiplier=self.config.interpolation_multiplier)
+        action_interval = interpolator.get_control_interval(self.config.fps)
 
         try:
             while self.running:
                 start_time = time.perf_counter()
 
-                action_tensor = self.action_queue.get()
+                if interpolator.needs_new_action():
+                    new_action = self.action_queue.get()
+                    if new_action is not None:
+                        self.action_queue_size_history.append(self.action_queue.qsize())
+                        interpolator.add(new_action.cpu())
 
+                action_tensor = interpolator.get()
                 if action_tensor is not None:
-                    self.action_queue_size_history.append(self.action_queue.qsize())
                     action_tensor = action_tensor.cpu()
                     action_dict = {
                         key: action_tensor[i].item()
