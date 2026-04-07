@@ -22,12 +22,11 @@ import torch
 
 from .helpers import TimedAction
 
-GROOT_N16_TORSO_KEYS = [f"torso_{i}" for i in range(6)]
 GROOT_N16_RIGHT_ARM_KEYS = [f"right_arm_{i}" for i in range(7)]
 GROOT_N16_LEFT_ARM_KEYS = [f"left_arm_{i}" for i in range(7)]
 GROOT_N16_GRIPPER_KEYS = ["right_gripper_0", "left_gripper_0"]
 GROOT_N16_ACTION_KEYS = [*GROOT_N16_RIGHT_ARM_KEYS, *GROOT_N16_LEFT_ARM_KEYS, *GROOT_N16_GRIPPER_KEYS]
-GROOT_N16_STATE_KEYS = [*GROOT_N16_TORSO_KEYS, *GROOT_N16_RIGHT_ARM_KEYS, *GROOT_N16_LEFT_ARM_KEYS, *GROOT_N16_GRIPPER_KEYS]
+GROOT_N16_STATE_KEYS = [*GROOT_N16_RIGHT_ARM_KEYS, *GROOT_N16_LEFT_ARM_KEYS, *GROOT_N16_GRIPPER_KEYS]
 
 
 def _import_zmq_dependencies():
@@ -149,7 +148,7 @@ def validate_groot_robot_compatibility(
     action_keys = list(robot.action_features)
     if action_keys != GROOT_N16_ACTION_KEYS:
         raise ValueError(
-            "The 'groot_n16_zmq' backend currently supports only torso state + "
+            "The 'groot_n16_zmq' backend currently supports only "
             "right_arm_0..6 + left_arm_0..6 + right_gripper_0 + left_gripper_0 actions. "
             f"Received action features: {action_keys}"
         )
@@ -248,7 +247,6 @@ def build_groot_n16_observation(
     front_image = preprocess_groot_front_image(raw_observation[front_camera_key], image_size)
     left_image = preprocess_groot_wrist_image(raw_observation[left_wrist_camera_key], image_size)
     right_image = preprocess_groot_wrist_image(raw_observation[right_wrist_camera_key], image_size)
-    torso = np.asarray([raw_observation[key] for key in GROOT_N16_TORSO_KEYS], dtype=np.float32)
     right_arm = np.asarray([raw_observation[key] for key in GROOT_N16_RIGHT_ARM_KEYS], dtype=np.float32)
     left_arm = np.asarray([raw_observation[key] for key in GROOT_N16_LEFT_ARM_KEYS], dtype=np.float32)
     right_gripper = np.asarray([raw_observation["right_gripper_0"]], dtype=np.float32)
@@ -262,7 +260,6 @@ def build_groot_n16_observation(
             "cam_right_wrist": right_image[np.newaxis, np.newaxis],
         },
         "state": {
-            "torso": torso[np.newaxis, np.newaxis],
             "left_arm": left_arm[np.newaxis, np.newaxis],
             "right_arm": right_arm[np.newaxis, np.newaxis],
             "left_gripper": left_gripper[np.newaxis, np.newaxis],

@@ -47,7 +47,6 @@ def test_build_groot_n16_observation_packs_and_spatially_normalizes_images():
     left = np.arange(640 * 480 * 3, dtype=np.uint8).reshape(640, 480, 3)
     right = np.full((640, 480, 3), 127, dtype=np.float32)
     raw_observation = {
-        **{f"torso_{i}": float(i) for i in range(6)},
         **{f"right_arm_{i}": float(i) for i in range(7)},
         **{f"left_arm_{i}": float(i + 10) for i in range(7)},
         "right_gripper_0": 1.0,
@@ -76,7 +75,6 @@ def test_build_groot_n16_observation_packs_and_spatially_normalizes_images():
     np.testing.assert_array_equal(packed["video"]["cam_left_wrist"][0, 0, :, 560:, :], 0)
     np.testing.assert_array_equal(packed["video"]["cam_right_wrist"][0, 0, :, :80, :], 0)
     np.testing.assert_array_equal(packed["video"]["cam_right_wrist"][0, 0, :, 560:, :], 0)
-    assert packed["state"]["torso"].shape == (1, 1, 6)
     assert packed["state"]["left_arm"].shape == (1, 1, 7)
     assert packed["state"]["right_arm"].shape == (1, 1, 7)
     assert packed["state"]["right_arm"].dtype == np.float32
@@ -134,7 +132,12 @@ def test_groot_action_dict_to_timed_actions_preserves_order_and_timing():
 def test_validate_groot_robot_compatibility_rejects_non_bilateral_layout():
     class FakeRobot:
         action_features = {"left_arm_0": float}
-        observation_features = {"left_arm_0": float, "front": (480, 640, 3), "left": (640, 480, 3), "right": (640, 480, 3)}
+        observation_features = {
+            "left_arm_0": float,
+            "front": (480, 640, 3),
+            "left": (640, 480, 3),
+            "right": (640, 480, 3),
+        }
 
     with pytest.raises(ValueError, match="right_arm_0"):
         validate_groot_robot_compatibility(
@@ -158,7 +161,6 @@ def test_robot_client_groot_backend_enqueues_and_executes_actions(monkeypatch):
             self.right = np.full((640, 480, 3), 127, dtype=np.uint8)
             self.action_features = {key: float for key in GROOT_N16_ACTION_KEYS}
             self.observation_features = {
-                **{f"torso_{i}": float for i in range(6)},
                 **self.action_features,
                 "front": (480, 640, 3),
                 "left": (640, 480, 3),
@@ -175,7 +177,6 @@ def test_robot_client_groot_backend_enqueues_and_executes_actions(monkeypatch):
 
         def get_observation(self):
             return {
-                **{f"torso_{i}": float(i) for i in range(6)},
                 **{f"right_arm_{i}": float(i) for i in range(7)},
                 **{f"left_arm_{i}": float(i + 10) for i in range(7)},
                 "right_gripper_0": 1.0,
