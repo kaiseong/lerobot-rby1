@@ -307,6 +307,40 @@ def test_control_loop_observation_applies_client_side_crops(robot_client, monkey
     assert not robot_client.must_go.is_set()
 
 
+def test_round_trip_metrics_match_observation_send_record(robot_client):
+    from lerobot.async_inference.helpers import TimedAction, TimedObservation
+
+    observation = TimedObservation(
+        observation={"joint1": 0.0},
+        timestamp=123.456,
+        timestep=7,
+    )
+    robot_client._register_pending_observation_metrics(
+        observation=observation,
+        send_started_perf=10.0,
+        rpc_started_perf=10.3,
+        send_completed_perf=10.8,
+        serialize_time=0.2,
+    )
+
+    metrics = robot_client._pop_round_trip_metrics(
+        TimedAction(action=torch.zeros(6), timestep=7, timestamp=123.456),
+        receive_perf=12.3,
+    )
+
+    assert metrics == {
+        "observation_to_action_rtt_ms": pytest.approx(2300.0),
+        "send_rpc_ms": pytest.approx(500.0),
+        "wait_after_send_ms": pytest.approx(1500.0),
+        "serialize_ms": pytest.approx(200.0),
+    }
+
+
+def test_format_latency_metric_handles_nan(robot_client):
+    assert robot_client._format_latency_metric(float("nan")) == "n/a"
+    assert robot_client._format_latency_metric(12.3456) == "12.35ms"
+
+
 # -----------------------------------------------------------------------------
 # Regression test: robot type registry populated by robot_client imports
 # -----------------------------------------------------------------------------

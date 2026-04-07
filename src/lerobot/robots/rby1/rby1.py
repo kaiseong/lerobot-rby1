@@ -271,8 +271,8 @@ _ALL_JOINT_NAMES: list[str] = _TORSO_NAMES + _RIGHT_ARM_NAMES + _LEFT_ARM_NAMES
 # Ready pose — matches _READY_POSE in rby1_vr.py
 # ---------------------------------------------------------------------------
 _READY_TORSO = np.deg2rad([0.0, 0.0, 0.0, 10.0, 0.0, 0.0])
-_READY_RIGHT = np.deg2rad([75.0, -5.0, 0.0, -110.0, 20.0, -45.0, 60.0])
-_READY_LEFT  = np.deg2rad([75.0, 5.0, 0.0, -110.0, -20.0, -45.0, -60.0])
+_READY_RIGHT = np.deg2rad([20.0, -23.0, -30.0, -95.0, 55.0, -70.0, 0.0])
+_READY_LEFT  = np.deg2rad([20.0, 23.0, 30.0, -95.0, -55.0, -70.0, 0.0])
 _READY_POSE  = np.concatenate([_READY_TORSO, _READY_RIGHT, _READY_LEFT])  # (20,)
 _READY_HEAD  = np.deg2rad([0.0, 45.0])  # head_0, head_1
 

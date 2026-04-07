@@ -23,11 +23,13 @@ import logging
 import pickle  # nosec
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import asdict
 from pprint import pformat
 from queue import Queue
 from typing import Any
+import math
 
 import draccus
 import grpc
@@ -71,6 +73,7 @@ from .helpers import (
 class RobotClient:
     prefix = "robot_client"
     logger = get_logger(prefix)
+    _MAX_PENDING_OBSERVATION_METRICS = 512
 
     def __init__(self, config: RobotClientConfig):
         """Initialize RobotClient with unified configuration.
@@ -105,6 +108,10 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
+        self._pending_observation_metrics_lock = threading.Lock()
+        self._pending_observation_metrics: OrderedDict[
+            tuple[int, float], dict[str, float]
+        ] = OrderedDict()
 
         self.policy_config: RemotePolicyConfig | None = None
         self.channel = None
@@ -223,12 +230,13 @@ class RobotClient:
 
         assert self.stub is not None
 
-        start_time = time.perf_counter()
+        send_started_perf = time.perf_counter()
         observation_bytes = pickle.dumps(obs)
-        serialize_time = time.perf_counter() - start_time
+        serialize_time = time.perf_counter() - send_started_perf
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
         try:
+            rpc_started_perf = time.perf_counter()
             observation_iterator = send_bytes_in_chunks(
                 observation_bytes,
                 services_pb2.Observation,
@@ -236,8 +244,19 @@ class RobotClient:
                 silent=True,
             )
             _ = self.stub.SendObservations(observation_iterator)
+            send_completed_perf = time.perf_counter()
             obs_timestep = obs.get_timestep()
+            self._register_pending_observation_metrics(
+                observation=obs,
+                send_started_perf=send_started_perf,
+                rpc_started_perf=rpc_started_perf,
+                send_completed_perf=send_completed_perf,
+                serialize_time=serialize_time,
+            )
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
+            self.logger.debug(
+                f"Observation #{obs_timestep} send RPC time: {(send_completed_perf - rpc_started_perf) * 1000:.2f}ms"
+            )
 
             return True
 
@@ -251,6 +270,54 @@ class RobotClient:
             timestamps = sorted([action.get_timestep() for action in self.action_queue.queue])
         self.logger.debug(f"Queue size: {queue_size}, Queue contents: {timestamps}")
         return queue_size, timestamps
+
+    @staticmethod
+    def _format_latency_metric(value_ms: float) -> str:
+        if math.isnan(value_ms):
+            return "n/a"
+        return f"{value_ms:.2f}ms"
+
+    def _register_pending_observation_metrics(
+        self,
+        observation: TimedObservation,
+        send_started_perf: float,
+        rpc_started_perf: float,
+        send_completed_perf: float,
+        serialize_time: float,
+    ) -> None:
+        key = (observation.get_timestep(), observation.get_timestamp())
+        with self._pending_observation_metrics_lock:
+            self._pending_observation_metrics[key] = {
+                "send_started_perf": send_started_perf,
+                "rpc_started_perf": rpc_started_perf,
+                "send_completed_perf": send_completed_perf,
+                "serialize_time": serialize_time,
+            }
+            self._pending_observation_metrics.move_to_end(key)
+            while len(self._pending_observation_metrics) > self._MAX_PENDING_OBSERVATION_METRICS:
+                self._pending_observation_metrics.popitem(last=False)
+
+    def _pop_round_trip_metrics(
+        self,
+        first_action: TimedAction,
+        receive_perf: float,
+    ) -> dict[str, float] | None:
+        key = (first_action.get_timestep(), first_action.get_timestamp())
+        with self._pending_observation_metrics_lock:
+            pending_metrics = self._pending_observation_metrics.pop(key, None)
+
+        if pending_metrics is None:
+            return None
+
+        return {
+            "observation_to_action_rtt_ms": max(0.0, (receive_perf - pending_metrics["send_started_perf"]) * 1000),
+            "send_rpc_ms": max(
+                0.0,
+                (pending_metrics["send_completed_perf"] - pending_metrics["rpc_started_perf"]) * 1000,
+            ),
+            "wait_after_send_ms": max(0.0, (receive_perf - pending_metrics["send_completed_perf"]) * 1000),
+            "serialize_ms": pending_metrics["serialize_time"] * 1000,
+        }
 
     def _aggregate_action_queues(
         self,
@@ -321,6 +388,7 @@ class RobotClient:
                     continue
 
                 receive_time = time.time()
+                receive_perf = time.perf_counter()
                 deserialize_start = time.perf_counter()
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
@@ -331,6 +399,28 @@ class RobotClient:
 
                 timed_actions = self._move_actions_to_client_device(timed_actions)
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+
+                if len(timed_actions) > 0:
+                    first_action = timed_actions[0]
+                    round_trip_metrics = self._pop_round_trip_metrics(first_action, receive_perf)
+                    if round_trip_metrics is None:
+                        round_trip_metrics = {
+                            "observation_to_action_rtt_ms": max(
+                                0.0, (receive_time - first_action.get_timestamp()) * 1000
+                            ),
+                            "send_rpc_ms": float("nan"),
+                            "wait_after_send_ms": float("nan"),
+                            "serialize_ms": float("nan"),
+                        }
+
+                    self.logger.info(
+                        f"Obs #{first_action.get_timestep()} -> Action RTT: "
+                        f"{self._format_latency_metric(round_trip_metrics['observation_to_action_rtt_ms'])} | "
+                        f"Send RPC: {self._format_latency_metric(round_trip_metrics['send_rpc_ms'])} | "
+                        f"Post-send wait: {self._format_latency_metric(round_trip_metrics['wait_after_send_ms'])} | "
+                        f"Obs serialize: {self._format_latency_metric(round_trip_metrics['serialize_ms'])} | "
+                        f"Action deserialize: {self._format_latency_metric(deserialize_time * 1000)}"
+                    )
 
                 if len(timed_actions) > 0 and verbose:
                     with self.latest_action_lock:
@@ -343,13 +433,13 @@ class RobotClient:
 
                     incoming_timesteps = [a.get_timestep() for a in timed_actions]
                     first_action_timestep = timed_actions[0].get_timestep()
-                    server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
+                    observation_to_action_rtt = (receive_time - timed_actions[0].get_timestamp()) * 1000
 
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
                         f"Latest action: #{latest_action} | "
                         f"Incoming actions: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
-                        f"Network latency (server->client): {server_to_client_latency:.2f}ms | "
+                        f"Observation-to-action RTT: {observation_to_action_rtt:.2f}ms | "
                         f"Deserialization time: {deserialize_time * 1000:.2f}ms"
                     )
 

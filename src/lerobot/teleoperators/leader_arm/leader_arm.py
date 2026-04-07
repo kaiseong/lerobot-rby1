@@ -254,8 +254,11 @@ class Rby1LeaderArm(Teleoperator):
 
             # First call after init completes
             if not teleop._init_done:
-                right_q_hold[0] = state.q_joint[0:7].copy()
-                left_q_hold[0] = state.q_joint[7:14].copy()
+                # Latch the configured init targets, not the measured master-arm pose.
+                # This prevents sag from weak gravity compensation from immediately
+                # propagating to the robot after reset completes.
+                right_q_hold[0] = right_init_q.copy()
+                left_q_hold[0] = left_init_q.copy()
                 teleop._init_done = True
 
             # -- B. Read triggers ----------------------------------------
