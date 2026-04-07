@@ -44,9 +44,9 @@ Usage:
 
     # 1. Start the policy server (on a GPU machine) with RTC enabled:
     python -m lerobot.async_inference.policy_server \
-        --host=0.0.0.0 \
-        --port=8080 \
-        --fps=30 \
+        --host=192.168.0.3 \
+        --port=8095 \
+        --fps=15 \
         --rtc.enabled=true \
         --rtc.execution_horizon=10 \
         --rtc.max_guidance_weight=5.0 \
@@ -54,18 +54,17 @@ Usage:
 
     # 2. Run this client (on the robot machine):
     python examples/rtc/eval_with_real_robot_async.py \
-        --robot.type=so100_follower \
-        --robot.port=/dev/ttyUSB0 \
-        --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
-        --server_address=GPU_MACHINE_IP:8080 \
-        --policy_type=pi0 \
-        --pretrained_name_or_path=lerobot/pi0-so100-multitask \
+        --robot.type=rby1 \
+        --server_address=192.168.0.3:8095 \
+        --policy_type=pi05 \
+        --pretrained_name_or_path=rainbowrobotics/simtos_one_item_rel_0404_xFvFc20 \
         --policy_device=cuda \
-        --actions_per_chunk=50 \
-        --task="Pick up the object" \
+        --actions_per_chunk=20 \
+        --task="Sort the trash: Put cans in the light blue bin, PET bottles in the pink bin and general waste in the green bin" \
         --rtc.enabled=true \
         --rtc.execution_horizon=10 \
-        --duration=120
+        --duration=120 \
+        --fps=15
 """
 
 import logging
@@ -477,8 +476,6 @@ class RTCAsyncClient:
 @draccus.wrap()
 def main(cfg: RTCAsyncClientConfig):
     """Entry point for RTC + Async inference client."""
-    register_third_party_plugins()
-
     logger.info(f"Config: server={cfg.server_address}, policy={cfg.policy_type}, rtc={cfg.rtc.enabled}")
 
     client = RTCAsyncClient(cfg)
@@ -486,4 +483,5 @@ def main(cfg: RTCAsyncClientConfig):
 
 
 if __name__ == "__main__":
+    register_third_party_plugins()
     main()
