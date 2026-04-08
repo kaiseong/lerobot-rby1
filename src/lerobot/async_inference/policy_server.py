@@ -90,6 +90,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
+        self.obs_atol = 1.0
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
@@ -216,6 +217,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Policy type: {policy_specs.policy_type} | "
             f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
+            f"Obs atol: {getattr(policy_specs, 'obs_atol', getattr(policy_specs, 'observation_similarity_atol', 1.0))} | "
             f"Device: {policy_specs.device}"
         )
 
@@ -223,6 +225,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self.obs_atol = getattr(policy_specs, "obs_atol", getattr(policy_specs, "observation_similarity_atol", 1.0))
 
         policy_class = get_policy_class(self.policy_type)
 
@@ -366,9 +369,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False
 
-        elif observations_similar(obs, previous_obs, lerobot_features=self.lerobot_features):
+        elif observations_similar(
+            obs,
+            previous_obs,
+            lerobot_features=self.lerobot_features,
+            atol=self.obs_atol,
+        ):
             self.logger.debug(
-                f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted!"
+                f"Skipping observation #{obs.get_timestep()} - Observation too similar to last obs predicted! "
+                f"(atol={self.obs_atol})"
             )
             return False
 

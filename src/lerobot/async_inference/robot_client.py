@@ -20,6 +20,7 @@ python src/lerobot/async_inference/robot_client.py         --robot.type=so100_fo
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
@@ -29,7 +30,6 @@ from dataclasses import asdict
 from pprint import pformat
 from queue import Queue
 from typing import Any
-import math
 
 import draccus
 import grpc
@@ -90,7 +90,6 @@ class RobotClient:
 
         self.shutdown_event = threading.Event()
 
-        # Initialize client side variables
         self.latest_action_lock = threading.Lock()
         self.latest_action = -1
         self.action_chunk_size = -1
@@ -98,20 +97,17 @@ class RobotClient:
         self._chunk_size_threshold = config.chunk_size_threshold
 
         self.action_queue = Queue()
-        self.action_queue_lock = threading.Lock()  # Protect queue operations
+        self.action_queue_lock = threading.Lock()
         self.action_queue_size = []
-        self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+        self.start_barrier = threading.Barrier(2)
 
-        # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
 
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
         self._pending_observation_metrics_lock = threading.Lock()
-        self._pending_observation_metrics: OrderedDict[
-            tuple[int, float], dict[str, float]
-        ] = OrderedDict()
+        self._pending_observation_metrics: OrderedDict[tuple[int, float], dict[str, float]] = OrderedDict()
 
         self.policy_config: RemotePolicyConfig | None = None
         self.channel = None
@@ -126,6 +122,7 @@ class RobotClient:
                 lerobot_features,
                 config.actions_per_chunk,
                 config.policy_device,
+                config.obs_atol,
                 client_image_crop_applied=bool(config.image_crop_params),
             )
             self.channel = grpc.insecure_channel(
@@ -213,6 +210,8 @@ class RobotClient:
             self.remote_client = None
             self.logger.debug("GR00T ZMQ client closed")
 
+        self.logger.debug("Client stopped")
+
     def send_observation(
         self,
         obs: TimedObservation,
@@ -221,10 +220,8 @@ class RobotClient:
         Returns True if the observation was sent successfully, False otherwise."""
         if not self.uses_grpc_backend:
             raise RuntimeError("send_observation is only valid for the gRPC backend")
-
         if not self.running:
             raise RuntimeError("Client not running. Run RobotClient.start() before sending observations.")
-
         if not isinstance(obs, TimedObservation):
             raise ValueError("Input observation needs to be a TimedObservation!")
 
@@ -257,7 +254,10 @@ class RobotClient:
             self.logger.debug(
                 f"Observation #{obs_timestep} send RPC time: {(send_completed_perf - rpc_started_perf) * 1000:.2f}ms"
             )
-
+            self.logger.debug(f"Sent observation #{obs_timestep} | ")
+            self.logger.debug(
+                f"Observation #{obs_timestep} send RPC time: {(send_completed_perf - rpc_started_perf) * 1000:.2f}ms"
+            )
             return True
 
         except grpc.RpcError as e:
@@ -350,7 +350,8 @@ class RobotClient:
                     timestamp=new_action.get_timestamp(),
                     timestep=new_action.get_timestep(),
                     action=aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
+                        current_action_queue[new_action.get_timestep()],
+                        new_action.get_action(),
                     ),
                 )
             )
@@ -412,7 +413,6 @@ class RobotClient:
                             "wait_after_send_ms": float("nan"),
                             "serialize_ms": float("nan"),
                         }
-
                     self.logger.info(
                         f"Obs #{first_action.get_timestep()} -> Action RTT: "
                         f"{self._format_latency_metric(round_trip_metrics['observation_to_action_rtt_ms'])} | "
@@ -434,7 +434,6 @@ class RobotClient:
                     incoming_timesteps = [a.get_timestep() for a in timed_actions]
                     first_action_timestep = timed_actions[0].get_timestep()
                     observation_to_action_rtt = (receive_time - timed_actions[0].get_timestamp()) * 1000
-
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
                         f"Latest action: #{latest_action} | "
@@ -454,6 +453,7 @@ class RobotClient:
                     with self.latest_action_lock:
                         latest_action = self.latest_action
 
+                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
                     self.logger.info(
                         f"Latest action: {latest_action} | "
                         f"Old action steps: {old_timesteps[0]}:{old_timesteps[-1]} | "
@@ -462,8 +462,7 @@ class RobotClient:
                     )
                     self.logger.debug(
                         f"Queue update complete ({queue_update_time:.6f}s) | "
-                        f"Before: {old_size} items | "
-                        f"After: {new_size} items | "
+                        f"Before: {old_size} items | After: {new_size} items | "
                     )
 
             except grpc.RpcError as e:
@@ -515,7 +514,6 @@ class RobotClient:
 
     def _capture_timed_observation(self, task: str) -> tuple[TimedObservation, RawObservation, int, float]:
         start_time = time.perf_counter()
-
         raw_observation: RawObservation = self.robot.get_observation()
         raw_observation = apply_observation_crops(raw_observation, self.config.image_crop_params)
         raw_observation["task"] = task
@@ -565,7 +563,6 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
             return None
-
     def control_loop_groot_inference(self, task: str, verbose: bool = False) -> RawObservation | None:
         if not self.uses_groot_backend:
             raise RuntimeError("control_loop_groot_inference is only valid for the GR00T backend")
@@ -629,7 +626,6 @@ class RobotClient:
                 )
 
             return raw_observation
-
         except Exception as e:
             self.logger.error(f"Error in GR00T inference loop: {e}")
             return None
@@ -648,7 +644,6 @@ class RobotClient:
 
             if self.actions_available():
                 performed_action = self.control_loop_action(verbose)
-
             if self._ready_to_send_observation():
                 if self.uses_grpc_backend:
                     captured_observation = self.control_loop_observation(task, verbose)
@@ -687,4 +682,4 @@ def async_client(cfg: RobotClientConfig):
 
 if __name__ == "__main__":
     register_third_party_plugins()
-    async_client()  # run the client
+    async_client()

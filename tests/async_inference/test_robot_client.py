@@ -375,3 +375,49 @@ def test_robot_client_registers_builtin_robot_types():
             f"Ensure the corresponding module is imported in robot_client.py. "
             f"Known choices: {sorted(known_choices)}"
         )
+
+
+def test_robot_client_passes_obs_atol_to_remote_policy_config():
+    """Client config should propagate observation similarity tolerance to the server setup payload."""
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    test_config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        obs_atol=0.25,
+    )
+
+    client = RobotClient(test_config)
+    try:
+        assert client.policy_config.obs_atol == pytest.approx(0.25)
+    finally:
+        if client.robot.is_connected:
+            client.stop()
+
+
+def test_robot_client_marks_client_side_crop_in_remote_policy_config():
+    """Client-side image cropping should be surfaced to the server setup payload."""
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import RobotClient
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    test_config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        image_crop_params={"front": (0, 0, 10, 10)},
+    )
+
+    client = RobotClient(test_config)
+    try:
+        assert client.policy_config.client_image_crop_applied is True
+    finally:
+        if client.robot.is_connected:
+            client.stop()

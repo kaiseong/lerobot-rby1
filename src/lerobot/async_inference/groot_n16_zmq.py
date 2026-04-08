@@ -134,7 +134,6 @@ def normalize_zmq_server_address(server_address: str) -> str:
         raise ValueError(
             f"GR00T backend expects server_address in 'host:port' format, got {server_address!r}"
         )
-
     return f"tcp://{host}:{port}"
 
 

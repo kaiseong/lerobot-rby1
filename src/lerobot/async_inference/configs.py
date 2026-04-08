@@ -150,6 +150,10 @@ class RobotClientConfig:
 
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
+    obs_atol: float = field(
+        default=1.0,
+        metadata={"help": "State-space absolute tolerance for server-side observation similarity filtering"},
+    )
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
     image_crop_params: dict[str, tuple[int, int, int, int]] = field(
         default_factory=dict,
@@ -218,6 +222,9 @@ class RobotClientConfig:
         if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
             raise ValueError(f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}")
 
+        if self.obs_atol < 0:
+            raise ValueError(f"obs_atol must be non-negative, got {self.obs_atol}")
+
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
 
@@ -240,7 +247,6 @@ class RobotClientConfig:
             raise ValueError(
                 f"groot_image_size must be a pair of integers (height, width), got {self.groot_image_size}"
             )
-
         groot_height, groot_width = (int(v) for v in self.groot_image_size)
         if groot_height <= 0 or groot_width <= 0:
             raise ValueError(f"groot_image_size dimensions must be positive, got {self.groot_image_size}")
@@ -252,7 +258,6 @@ class RobotClientConfig:
                 raise ValueError(
                     f"image_crop_params['{key}'] must have four values (top, left, height, width), got {value}"
                 )
-
             top, left, height, width = (int(v) for v in value)
             if top < 0 or left < 0:
                 raise ValueError(
@@ -262,9 +267,7 @@ class RobotClientConfig:
                 raise ValueError(
                     f"image_crop_params['{key}'] must use positive height/width, got {value}"
                 )
-
             normalized_crop_params[key] = (top, left, height, width)
-
         self.image_crop_params = normalized_crop_params
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
@@ -283,6 +286,7 @@ class RobotClientConfig:
             "policy_device": self.policy_device,
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
+            "obs_atol": self.obs_atol,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "image_crop_params": self.image_crop_params,

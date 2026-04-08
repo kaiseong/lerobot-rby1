@@ -86,6 +86,40 @@ def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, 
     return resized.squeeze(0)
 
 
+def crop_raw_observation_image(image: Any, crop_params: tuple[int, int, int, int]) -> np.ndarray:
+    image_arr = np.asarray(image)
+    if image_arr.ndim != 3:
+        raise ValueError(f"Expected image with shape (H, W, C), got {image_arr.shape}")
+
+    top, left, height, width = crop_params
+    bottom = top + height
+    right = left + width
+    if top < 0 or left < 0 or height <= 0 or width <= 0:
+        raise ValueError(f"Invalid crop params {crop_params}")
+    if bottom > image_arr.shape[0] or right > image_arr.shape[1]:
+        raise ValueError(
+            f"Crop params {crop_params} exceed image bounds {image_arr.shape[:2]}"
+        )
+
+    return np.ascontiguousarray(image_arr[top:bottom, left:right, ...])
+
+
+def apply_observation_crops(
+    raw_observation: RawObservation,
+    crop_params_dict: dict[str, tuple[int, int, int, int]],
+) -> RawObservation:
+    if not crop_params_dict:
+        return dict(raw_observation)
+
+    cropped_observation = dict(raw_observation)
+    for key, crop_params in crop_params_dict.items():
+        if key not in raw_observation:
+            raise KeyError(f"Cannot crop missing observation key '{key}'")
+        cropped_observation[key] = crop_raw_observation_image(raw_observation[key], crop_params)
+
+    return cropped_observation
+
+
 # TODO(Steven): Consider implementing a pipeline step for this
 def raw_observation_to_observation(
     raw_observation: RawObservation,
@@ -280,6 +314,7 @@ class RemotePolicyConfig:
     lerobot_features: dict[str, PolicyFeature]
     actions_per_chunk: int
     device: str = "cpu"
+    obs_atol: float = 1.0
     rename_map: dict[str, str] = field(default_factory=dict)
     preprocessor_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_image_crop_applied: bool = False

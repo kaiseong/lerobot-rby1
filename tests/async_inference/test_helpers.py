@@ -345,6 +345,43 @@ def test_resize_robot_observation_image():
     assert resized.max() <= 255
 
 
+def test_crop_raw_observation_image():
+    image = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
+    cropped = crop_raw_observation_image(image, (1, 2, 4, 4))
+
+    assert cropped.shape == (4, 4, 3)
+    np.testing.assert_array_equal(cropped, image[1:5, 2:6, :])
+
+
+def test_apply_observation_crops_preserves_non_image_fields():
+    front = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
+    right = np.full((10, 10, 3), 255, dtype=np.uint8)
+    raw_observation = {
+        "front": front,
+        "right": right,
+        "joint_1": 1.5,
+        "task": "demo",
+    }
+
+    cropped = apply_observation_crops(
+        raw_observation,
+        {
+            "front": (1, 2, 4, 4),
+            "right": (0, 0, 5, 6),
+        },
+    )
+
+    np.testing.assert_array_equal(cropped["front"], front[1:5, 2:6, :])
+    np.testing.assert_array_equal(cropped["right"], right[:5, :6, :])
+    assert cropped["joint_1"] == 1.5
+    assert cropped["task"] == "demo"
+
+
+def test_apply_observation_crops_missing_key_raises():
+    with pytest.raises(KeyError, match="missing observation key"):
+        apply_observation_crops({"front": np.zeros((4, 4, 3), dtype=np.uint8)}, {"right": (0, 0, 2, 2)})
+
+
 def test_prepare_raw_observation():
     """Test the preparation of raw robot observation to lerobot format."""
     robot_obs = _create_mock_robot_observation()
