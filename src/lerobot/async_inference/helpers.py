@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.configs.types import PolicyFeature
@@ -46,7 +47,7 @@ RawObservation = dict[str, Any]
 # observation as those recorded in LeRobot dataset (keys are different)
 LeRobotObservation = dict[str, torch.Tensor]
 
-# observation, ready for policy inference (image keys resized)
+# observation, ready for policy inference
 Observation = dict[str, torch.Tensor]
 
 
@@ -84,15 +85,56 @@ def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, 
     return resized.squeeze(0)
 
 
+def crop_raw_observation_image(image: Any, crop_params: tuple[int, int, int, int]) -> np.ndarray:
+    image_arr = np.asarray(image)
+    if image_arr.ndim != 3:
+        raise ValueError(f"Expected image with shape (H, W, C), got {image_arr.shape}")
+
+    top, left, height, width = crop_params
+    bottom = top + height
+    right = left + width
+    if top < 0 or left < 0 or height <= 0 or width <= 0:
+        raise ValueError(f"Invalid crop params {crop_params}")
+    if bottom > image_arr.shape[0] or right > image_arr.shape[1]:
+        raise ValueError(
+            f"Crop params {crop_params} exceed image bounds {image_arr.shape[:2]}"
+        )
+
+    return np.ascontiguousarray(image_arr[top:bottom, left:right, ...])
+
+
+def apply_observation_crops(
+    raw_observation: RawObservation,
+    crop_params_dict: dict[str, tuple[int, int, int, int]],
+) -> RawObservation:
+    if not crop_params_dict:
+        return dict(raw_observation)
+
+    cropped_observation = dict(raw_observation)
+    for key, crop_params in crop_params_dict.items():
+        if key not in raw_observation:
+            raise KeyError(f"Cannot crop missing observation key '{key}'")
+        cropped_observation[key] = crop_raw_observation_image(raw_observation[key], crop_params)
+
+    return cropped_observation
+
+
 # TODO(Steven): Consider implementing a pipeline step for this
 def raw_observation_to_observation(
     raw_observation: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
+    *,
+    apply_legacy_resize: bool = True,
 ) -> Observation:
     observation = {}
 
-    observation = prepare_raw_observation(raw_observation, lerobot_features, policy_image_features)
+    observation = prepare_raw_observation(
+        raw_observation,
+        lerobot_features,
+        policy_image_features,
+        apply_legacy_resize=apply_legacy_resize,
+    )
     for k, v in observation.items():
         if isinstance(v, torch.Tensor):  # VLAs present natural-language instructions in observations
             if "image" in k:
@@ -144,6 +186,8 @@ def prepare_raw_observation(
     robot_obs: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
+    *,
+    apply_legacy_resize: bool = True,
 ) -> Observation:
     """Matches keys from the raw robot_obs dict to the keys expected by a given policy (passed as
     policy_image_features)."""
@@ -155,16 +199,16 @@ def prepare_raw_observation(
     image_keys = list(filter(is_image_key, lerobot_obs))
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
-    image_dict = {
-        image_k: extract_images_from_raw_observation(lerobot_obs, image_k) for image_k in image_keys
-    }
-
-    # Turns the image features to (C, H, W) with H, W matching the policy image features.
-    # This reduces the resolution of the images
-    image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
-        for key in image_keys
-    }
+    image_dict = {}
+    for image_key in image_keys:
+        if apply_legacy_resize:
+            image_dict[image_key] = resize_robot_observation_image(
+                torch.tensor(lerobot_obs[image_key]), policy_image_features[image_key].shape
+            )
+        else:
+            image_dict[image_key] = extract_images_from_raw_observation(lerobot_obs, image_key).permute(
+                2, 0, 1
+            ).contiguous()
 
     if "task" in robot_obs:
         state_dict["task"] = robot_obs["task"]
@@ -275,7 +319,10 @@ class RemotePolicyConfig:
     lerobot_features: dict[str, PolicyFeature]
     actions_per_chunk: int
     device: str = "cpu"
+    obs_atol: float = 1.0
     rename_map: dict[str, str] = field(default_factory=dict)
+    preprocessor_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    client_image_crop_applied: bool = False
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

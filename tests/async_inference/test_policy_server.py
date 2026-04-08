@@ -189,6 +189,18 @@ def test_obs_sanity_checks(policy_server):
     assert policy_server._obs_sanity_checks(obs_ok, prev) is True
 
 
+def test_obs_sanity_checks_uses_configured_similarity_atol(policy_server):
+    """Server-side similarity filtering should honor the client-provided tolerance."""
+    prev = _make_obs(torch.zeros(6), timestep=0)
+    obs = _make_obs(torch.ones(6) * 0.5, timestep=1)
+
+    policy_server.obs_atol = 2.0
+    assert policy_server._obs_sanity_checks(obs, prev) is False
+
+    policy_server.obs_atol = 0.1
+    assert policy_server._obs_sanity_checks(obs, prev) is True
+
+
 def test_predict_action_chunk(monkeypatch, policy_server):
     """End-to-end test of `_predict_action_chunk` with a stubbed _get_action_chunk."""
     # Import only when needed
