@@ -38,13 +38,15 @@ class MockPolicy:
 
     class _Config:
         robot_type = "dummy_robot"
+        use_action_prefix_conditioning = False
+        chunk_size = 20
 
         @property
         def image_features(self) -> dict[str, PolicyFeature]:
             """Empty image features since this test doesn't use images."""
             return {}
 
-    def predict_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
+    def predict_action_chunk(self, observation: dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         """Return a chunk of 20 dummy actions."""
         batch_size = len(observation[OBS_STATE])
         return torch.zeros(batch_size, 20, 6)
@@ -230,6 +232,38 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_get_predict_action_chunk_kwargs_uses_previous_chunk_overlap(policy_server):
+    policy_server.policy.config.use_action_prefix_conditioning = True
+    policy_server.policy.config.chunk_size = 20
+    policy_server._last_chunk_start_timestep = 0
+    policy_server._last_raw_action_chunk = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+
+    kwargs = policy_server._get_predict_action_chunk_kwargs(10)
+
+    assert "prev_chunk_left_over" in kwargs
+    assert kwargs["prev_chunk_left_over"].shape == (1, 10, 1)
+    assert kwargs["prev_chunk_left_over"][0, :, 0].tolist() == pytest.approx(list(range(10, 20)))
+
+
+def test_validate_async_policy_setup_requires_latest_only_for_trtc(policy_server):
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+
+    policy_server.policy.config.use_action_prefix_conditioning = True
+    policy_server.policy.config.chunk_size = 20
+    policy_server.actions_per_chunk = 20
+
+    with pytest.raises(ValueError, match="aggregate_fn_name must be 'latest_only'"):
+        policy_server._validate_async_policy_setup(
+            RemotePolicyConfig(
+                policy_type="pi05",
+                pretrained_name_or_path="dummy",
+                lerobot_features=policy_server.lerobot_features,
+                actions_per_chunk=20,
+                aggregate_fn_name="weighted_average",
+            )
+        )
 
 
 @require_package("grpcio", "grpc")

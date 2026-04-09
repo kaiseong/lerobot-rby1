@@ -123,6 +123,7 @@ class RobotClient:
                 config.actions_per_chunk,
                 config.policy_device,
                 config.obs_atol,
+                aggregate_fn_name=config.aggregate_fn_name,
                 client_image_crop_applied=bool(config.image_crop_params),
             )
             self.channel = grpc.insecure_channel(
@@ -524,7 +525,9 @@ class RobotClient:
         observation = TimedObservation(
             timestamp=time.time(),
             observation=raw_observation,
-            timestep=max(latest_action, 0),
+            # Observation `timestep` should represent the next action slot to be predicted,
+            # not the last action that was already executed.
+            timestep=max(latest_action + 1, 0),
         )
         obs_capture_time = time.perf_counter() - start_time
 

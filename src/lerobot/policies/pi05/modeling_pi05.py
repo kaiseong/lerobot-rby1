@@ -141,6 +141,65 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
+def build_prefix_step_mask(batch_size: int, chunk_size: int, prefix_length: int, device: torch.device) -> Tensor | None:
+    if prefix_length <= 0:
+        return None
+
+    step_mask = torch.zeros((batch_size, chunk_size), dtype=torch.bool, device=device)
+    step_mask[:, :prefix_length] = True
+    return step_mask
+
+
+def build_runtime_action_prefix(
+    prev_chunk_left_over: Tensor | None,
+    prefix_length: int,
+    max_action_dim: int,
+) -> tuple[Tensor | None, Tensor | None]:
+    if prev_chunk_left_over is None or prefix_length <= 0:
+        return None, None
+
+    if prev_chunk_left_over.ndim == 2:
+        prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+
+    batch_size = prev_chunk_left_over.shape[0]
+    device = prev_chunk_left_over.device
+    action_prefix_mask = torch.zeros((batch_size, prefix_length), dtype=torch.bool, device=device)
+
+    available_steps = min(prefix_length, prev_chunk_left_over.shape[1])
+    action_prefix_mask[:, :available_steps] = True
+
+    if available_steps == 0:
+        return None, None
+
+    action_prefix = pad_vector(prev_chunk_left_over[:, :available_steps], max_action_dim)
+    if available_steps < prefix_length:
+        action_prefix = F.pad(action_prefix, (0, 0, 0, prefix_length - available_steps))
+
+    return action_prefix, action_prefix_mask
+
+
+def apply_action_prefix(
+    actions_or_noise: Tensor,
+    action_prefix: Tensor | None,
+    action_prefix_mask: Tensor | None = None,
+) -> Tensor:
+    if action_prefix is None:
+        return actions_or_noise
+
+    prefix_steps = action_prefix.shape[1]
+    clamped = actions_or_noise.clone()
+    current_prefix = clamped[:, :prefix_steps]
+
+    if action_prefix_mask is None:
+        current_prefix = action_prefix.to(dtype=current_prefix.dtype)
+    else:
+        expanded_mask = action_prefix_mask.unsqueeze(-1).expand_as(action_prefix)
+        current_prefix = torch.where(expanded_mask, action_prefix.to(dtype=current_prefix.dtype), current_prefix)
+
+    clamped[:, :prefix_steps] = current_prefix
+    return clamped
+
+
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     images: torch.Tensor,
     height: int,
@@ -234,7 +293,11 @@ def get_image_valid_mask(batch: dict[str, Tensor], image_key: str, batch_size: i
     return ~missing
 
 
-def reduce_action_losses(losses: Tensor, action_dim_is_pad: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor]:
+def reduce_action_losses(
+    losses: Tensor,
+    action_dim_is_pad: Tensor | None = None,
+    action_step_is_pad: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
     valid_mask = torch.ones_like(losses, dtype=torch.bool)
     if action_dim_is_pad is not None:
         if not isinstance(action_dim_is_pad, torch.Tensor):
@@ -244,6 +307,15 @@ def reduce_action_losses(losses: Tensor, action_dim_is_pad: Tensor | None = None
         if action_dim_is_pad.dim() == 1:
             action_dim_is_pad = action_dim_is_pad.unsqueeze(0)
         valid_mask &= ~action_dim_is_pad.unsqueeze(1)
+
+    if action_step_is_pad is not None:
+        if not isinstance(action_step_is_pad, torch.Tensor):
+            action_step_is_pad = torch.as_tensor(action_step_is_pad, dtype=torch.bool, device=losses.device)
+        else:
+            action_step_is_pad = action_step_is_pad.to(device=losses.device, dtype=torch.bool)
+        if action_step_is_pad.dim() == 1:
+            action_step_is_pad = action_step_is_pad.unsqueeze(0)
+        valid_mask &= ~action_step_is_pad.unsqueeze(-1)
 
     masked_losses = losses * valid_mask.to(dtype=losses.dtype)
     per_sample_denominator = valid_mask.sum(dim=(1, 2)).clamp_min(1).to(dtype=losses.dtype)
@@ -771,6 +843,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+
+        if self.config.use_action_prefix_conditioning and self.config.action_prefix_length > 0:
+            x_t = apply_action_prefix(
+                x_t,
+                actions[:, : self.config.action_prefix_length],
+            )
+
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
@@ -843,6 +922,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
+        action_prefix = None
+        action_prefix_mask = None
+        if self.config.use_action_prefix_conditioning:
+            action_prefix, action_prefix_mask = build_runtime_action_prefix(
+                kwargs.get("prev_chunk_left_over"),
+                self.config.action_prefix_length,
+                self.config.max_action_dim,
+            )
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -860,7 +948,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
-        x_t = noise
+        x_t = apply_action_prefix(noise, action_prefix, action_prefix_mask)
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
@@ -890,6 +978,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
+            x_t = apply_action_prefix(x_t, action_prefix, action_prefix_mask)
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -1148,6 +1237,7 @@ class PI05Policy(PreTrainedPolicy):
     def reset(self):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
+        self._last_predicted_chunk = None
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
@@ -1241,7 +1331,15 @@ class PI05Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            predict_kwargs = {}
+            if self.config.use_action_prefix_conditioning and self._last_predicted_chunk is not None:
+                predict_kwargs["prev_chunk_left_over"] = self._last_predicted_chunk[:, self.config.n_action_steps :]
+
+            full_actions = self.predict_action_chunk(batch, **predict_kwargs)
+            if self.config.use_action_prefix_conditioning:
+                self._last_predicted_chunk = full_actions.detach().clone()
+
+            actions = full_actions[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
@@ -1288,7 +1386,20 @@ class PI05Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         action_dim_is_pad = batch.get(f"{ACTION}_dim_is_pad")
-        loss, per_sample_loss, loss_per_dim = reduce_action_losses(losses, action_dim_is_pad=action_dim_is_pad)
+        action_step_is_pad = None
+        if self.config.use_action_prefix_conditioning and self.config.action_prefix_length > 0:
+            action_step_is_pad = build_prefix_step_mask(
+                batch_size=losses.shape[0],
+                chunk_size=losses.shape[1],
+                prefix_length=self.config.action_prefix_length,
+                device=losses.device,
+            )
+
+        loss, per_sample_loss, loss_per_dim = reduce_action_losses(
+            losses,
+            action_dim_is_pad=action_dim_is_pad,
+            action_step_is_pad=action_step_is_pad,
+        )
 
         loss_dict = {
             "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),

@@ -36,6 +36,8 @@ class PI05Config(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
+    use_action_prefix_conditioning: bool = False
+    action_prefix_length: int = 4
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -105,6 +107,30 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             )
+
+        if self.action_prefix_length < 0:
+            raise ValueError(f"action_prefix_length ({self.action_prefix_length}) cannot be negative")
+
+        if self.action_prefix_length > self.chunk_size:
+            raise ValueError(
+                f"action_prefix_length ({self.action_prefix_length}) cannot be greater than chunk_size ({self.chunk_size})"
+            )
+
+        if self.use_action_prefix_conditioning and self.action_prefix_length == 0:
+            raise ValueError("action_prefix_length must be > 0 when use_action_prefix_conditioning is enabled")
+
+        if self.use_action_prefix_conditioning and self.action_prefix_length > self.chunk_size - self.n_action_steps:
+            raise ValueError(
+                "action_prefix_length must satisfy action_prefix_length <= chunk_size - n_action_steps "
+                f"(got {self.action_prefix_length} > {self.chunk_size - self.n_action_steps})"
+            )
+
+        if (
+            self.use_action_prefix_conditioning
+            and self.rtc_config is not None
+            and self.rtc_config.enabled
+        ):
+            raise ValueError("use_action_prefix_conditioning cannot be enabled together with rtc_config.enabled")
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")

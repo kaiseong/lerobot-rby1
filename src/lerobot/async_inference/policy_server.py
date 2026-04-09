@@ -95,6 +95,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
         self._apply_legacy_image_resize = True
+        self._last_raw_action_chunk: torch.Tensor | None = None
+        self._last_chunk_start_timestep: int | None = None
         self.payload_log_dir = self._initialize_payload_log_dir()
 
     @property
@@ -184,6 +186,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
 
+        self._last_raw_action_chunk = None
+        self._last_chunk_start_timestep = None
+
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
         self.logger.info(f"Client {client_id} connected and ready")
@@ -258,12 +263,47 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             )
 
         self._apply_legacy_image_resize = not preprocessor_has_active_spatial_preprocess(self.preprocessor)
+        self._validate_async_policy_setup(policy_specs)
 
         end = time.perf_counter()
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
+
+    def _trtc_prefix_conditioning_enabled(self) -> bool:
+        return bool(self.policy is not None and getattr(self.policy.config, "use_action_prefix_conditioning", False))
+
+    def _validate_async_policy_setup(self, policy_specs: RemotePolicyConfig) -> None:
+        if not self._trtc_prefix_conditioning_enabled():
+            return
+
+        if self.actions_per_chunk != self.policy.config.chunk_size:
+            raise ValueError(
+                "When use_action_prefix_conditioning is enabled, actions_per_chunk must match chunk_size "
+                f"(got {self.actions_per_chunk} != {self.policy.config.chunk_size})"
+            )
+
+        if policy_specs.aggregate_fn_name != "latest_only":
+            raise ValueError(
+                "When use_action_prefix_conditioning is enabled for async inference, "
+                "aggregate_fn_name must be 'latest_only'."
+            )
+
+    def _get_predict_action_chunk_kwargs(self, observation_timestep: int) -> dict[str, Any]:
+        if not self._trtc_prefix_conditioning_enabled():
+            return {}
+
+        if self._last_raw_action_chunk is None or self._last_chunk_start_timestep is None:
+            return {}
+
+        stride = observation_timestep - self._last_chunk_start_timestep
+        if stride <= 0 or stride >= self._last_raw_action_chunk.shape[1]:
+            return {}
+
+        return {
+            "prev_chunk_left_over": self._last_raw_action_chunk[:, stride:],
+        }
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
@@ -420,13 +460,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+    def _get_action_chunk(self, observation: dict[str, torch.Tensor], **predict_kwargs: Any) -> torch.Tensor:
+        """Get a full action chunk from the policy."""
+        chunk = self.policy.predict_action_chunk(observation, **predict_kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
-        return chunk[:, : self.actions_per_chunk, :]
+        return chunk
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Predict an action chunk based on an observation.
@@ -456,7 +496,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        predict_kwargs = self._get_predict_action_chunk_kwargs(observation_t.get_timestep())
+        action_tensor = self._get_action_chunk(observation, **predict_kwargs)
+        self._last_raw_action_chunk = action_tensor.detach().clone()
+        self._last_chunk_start_timestep = observation_t.get_timestep()
+        action_tensor = action_tensor[:, : self.actions_per_chunk, :]
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"

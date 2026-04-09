@@ -307,6 +307,22 @@ def test_control_loop_observation_applies_client_side_crops(robot_client, monkey
     assert not robot_client.must_go.is_set()
 
 
+def test_capture_timed_observation_uses_next_action_timestep(robot_client, monkeypatch):
+    robot_client.latest_action = 9
+    robot_client.action_queue = Queue()
+    robot_client.must_go.set()
+
+    monkeypatch.setattr(
+        robot_client.robot,
+        "get_observation",
+        lambda: {"motor_1.pos": 1.0},
+    )
+
+    observation, _, _, _ = robot_client._capture_timed_observation(task="pick")
+
+    assert observation.get_timestep() == 10
+
+
 def test_round_trip_metrics_match_observation_send_record(robot_client):
     from lerobot.async_inference.helpers import TimedAction, TimedObservation
 
