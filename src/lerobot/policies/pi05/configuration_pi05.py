@@ -37,7 +37,7 @@ class PI05Config(PreTrainedConfig):
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
     use_action_prefix_conditioning: bool = False
-    action_prefix_length: int = 4
+    action_prefix_length: int = 4  # Maximum delay (in controller steps) simulated for training-time RTC
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
@@ -51,6 +51,12 @@ class PI05Config(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+
+    # Relative actions: action deltas are normalized in model space and mapped back to
+    # absolute robot actions in the postprocessor.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    action_feature_names: list[str] | None = None
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None

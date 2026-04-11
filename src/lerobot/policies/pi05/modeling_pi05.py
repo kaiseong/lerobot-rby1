@@ -17,6 +17,7 @@
 import builtins
 import logging
 import math
+import time
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
@@ -56,6 +57,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    prefix_delay_steps: int | Tensor | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -74,12 +76,12 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Computes sine-cosine positional embedding vectors for scalar or token-wise positions."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor is expected to be of shape `(batch_size,)` or `(batch_size, steps)`.")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -87,8 +89,12 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    if time.ndim == 1:
+        sin_input = scaling_factor[None, :] * time[:, None]
+        return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+
+    sin_input = scaling_factor[None, None, :] * time[:, :, None]
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
@@ -141,21 +147,68 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
-def build_prefix_step_mask(batch_size: int, chunk_size: int, prefix_length: int, device: torch.device) -> Tensor | None:
-    if prefix_length <= 0:
+def build_prefix_step_mask(
+    batch_size: int,
+    chunk_size: int,
+    prefix_length: int | Tensor | None,
+    device: torch.device,
+) -> Tensor | None:
+    if prefix_length is None:
         return None
 
-    step_mask = torch.zeros((batch_size, chunk_size), dtype=torch.bool, device=device)
-    step_mask[:, :prefix_length] = True
-    return step_mask
+    if isinstance(prefix_length, torch.Tensor):
+        prefix_lengths = prefix_length.to(device=device, dtype=torch.long)
+    else:
+        if prefix_length <= 0:
+            return None
+        prefix_lengths = torch.full((batch_size,), prefix_length, dtype=torch.long, device=device)
+
+    if prefix_lengths.ndim == 0:
+        prefix_lengths = prefix_lengths.expand(batch_size)
+    elif prefix_lengths.numel() == 1:
+        prefix_lengths = prefix_lengths.reshape(1).expand(batch_size)
+    else:
+        prefix_lengths = prefix_lengths.reshape(batch_size)
+
+    prefix_lengths = prefix_lengths.clamp(min=0, max=chunk_size)
+    if prefix_lengths.max().item() == 0:
+        return None
+
+    steps = torch.arange(chunk_size, device=device).unsqueeze(0)
+    return steps < prefix_lengths.unsqueeze(1)
+
+
+def build_action_timestep_schedule(
+    timestep: Tensor,
+    prefix_step_mask: Tensor | None,
+) -> Tensor:
+    if prefix_step_mask is None:
+        return timestep
+
+    if timestep.ndim == 0:
+        timestep = timestep.unsqueeze(0)
+
+    if timestep.ndim == 1:
+        timestep = timestep[:, None].expand(-1, prefix_step_mask.shape[1]).clone()
+    elif timestep.ndim != 2:
+        raise ValueError("Expected timestep to be rank-1 or rank-2 when prefix conditioning is enabled.")
+
+    if timestep.shape != prefix_step_mask.shape:
+        raise ValueError(
+            f"Expected timestep shape {prefix_step_mask.shape} to match prefix mask, got {timestep.shape}"
+        )
+
+    return torch.where(prefix_step_mask, torch.ones_like(timestep), timestep)
 
 
 def build_runtime_action_prefix(
     prev_chunk_left_over: Tensor | None,
     prefix_length: int,
     max_action_dim: int,
+    chunk_size: int,
+    prefix_delay_steps: int | Tensor | None = None,
 ) -> tuple[Tensor | None, Tensor | None]:
-    if prev_chunk_left_over is None or prefix_length <= 0:
+    if prev_chunk_left_over is None or prefix_length <= 0 or chunk_size <= 0:
         return None, None
 
     if prev_chunk_left_over.ndim == 2:
@@ -163,17 +216,35 @@ def build_runtime_action_prefix(
 
     batch_size = prev_chunk_left_over.shape[0]
     device = prev_chunk_left_over.device
-    action_prefix_mask = torch.zeros((batch_size, prefix_length), dtype=torch.bool, device=device)
-
-    available_steps = min(prefix_length, prev_chunk_left_over.shape[1])
-    action_prefix_mask[:, :available_steps] = True
-
-    if available_steps == 0:
+    requested_mask = build_prefix_step_mask(
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        prefix_length=prefix_length if prefix_delay_steps is None else prefix_delay_steps,
+        device=device,
+    )
+    if requested_mask is None:
         return None, None
 
-    action_prefix = pad_vector(prev_chunk_left_over[:, :available_steps], max_action_dim)
-    if available_steps < prefix_length:
-        action_prefix = F.pad(action_prefix, (0, 0, 0, prefix_length - available_steps))
+    available_mask = build_prefix_step_mask(
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        prefix_length=min(chunk_size, prev_chunk_left_over.shape[1]),
+        device=device,
+    )
+    if available_mask is None:
+        return None, None
+
+    action_prefix_mask = requested_mask & available_mask
+    if not action_prefix_mask.any():
+        return None, None
+
+    action_prefix = torch.zeros(
+        (batch_size, chunk_size, max_action_dim),
+        dtype=prev_chunk_left_over.dtype,
+        device=device,
+    )
+    available_steps = min(chunk_size, prev_chunk_left_over.shape[1])
+    action_prefix[:, :available_steps] = pad_vector(prev_chunk_left_over[:, :available_steps], max_action_dim)
 
     return action_prefix, action_prefix_mask
 
@@ -743,6 +814,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
 
+    def sample_prefix_delay_steps(self, bsize: int, device: torch.device) -> Tensor | None:
+        if not self.config.use_action_prefix_conditioning or self.config.action_prefix_length <= 0:
+            return None
+        return torch.randint(
+            low=0,
+            high=self.config.action_prefix_length + 1,
+            size=(bsize,),
+            device=device,
+        )
+
     def embed_prefix(
         self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -833,7 +914,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        prefix_delay_steps: Tensor | None = None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -844,11 +935,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
 
+        prefix_step_mask = None
         if self.config.use_action_prefix_conditioning and self.config.action_prefix_length > 0:
-            x_t = apply_action_prefix(
-                x_t,
-                actions[:, : self.config.action_prefix_length],
+            if prefix_delay_steps is None:
+                prefix_delay_steps = self.sample_prefix_delay_steps(actions.shape[0], actions.device)
+            prefix_step_mask = build_prefix_step_mask(
+                batch_size=actions.shape[0],
+                chunk_size=self.config.chunk_size,
+                prefix_length=prefix_delay_steps,
+                device=actions.device,
             )
+            x_t = apply_action_prefix(x_t, actions, prefix_step_mask)
+            time = build_action_timestep_schedule(time, prefix_step_mask)
 
         u_t = noise - actions
 
@@ -923,12 +1021,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         action_prefix = None
-        action_prefix_mask = None
+        prefix_step_mask = None
         if self.config.use_action_prefix_conditioning:
-            action_prefix, action_prefix_mask = build_runtime_action_prefix(
+            action_prefix, prefix_step_mask = build_runtime_action_prefix(
                 kwargs.get("prev_chunk_left_over"),
                 self.config.action_prefix_length,
                 self.config.max_action_dim,
+                chunk_size=self.config.chunk_size,
+                prefix_delay_steps=kwargs.get("prefix_delay_steps"),
             )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
@@ -948,12 +1048,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
-        x_t = apply_action_prefix(noise, action_prefix, action_prefix_mask)
+        x_t = apply_action_prefix(noise, action_prefix, prefix_step_mask)
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_schedule = build_action_timestep_schedule(time_tensor, prefix_step_mask)
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+            def denoise_step_partial_call(input_x_t, current_timestep=time_schedule):
                 return self.denoise_step(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
@@ -978,7 +1079,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
-            x_t = apply_action_prefix(x_t, action_prefix, action_prefix_mask)
+            x_t = apply_action_prefix(x_t, action_prefix, prefix_step_mask)
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -1238,6 +1339,9 @@ class PI05Policy(PreTrainedPolicy):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
         self._last_predicted_chunk = None
+        self._estimated_env_dt = None
+        self._last_select_action_time = None
+        self._estimated_local_prefix_delay_steps = 0
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
@@ -1257,6 +1361,31 @@ class PI05Policy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _update_local_env_dt(self, now_s: float) -> None:
+        if self._last_select_action_time is None:
+            self._last_select_action_time = now_s
+            return
+
+        delta = now_s - self._last_select_action_time
+        self._last_select_action_time = now_s
+        if delta <= 0:
+            return
+
+        if self._estimated_env_dt is None:
+            self._estimated_env_dt = delta
+        else:
+            self._estimated_env_dt = 0.9 * self._estimated_env_dt + 0.1 * delta
+
+    def _estimate_local_prefix_delay_steps(self, inference_duration_s: float) -> int:
+        if not self.config.use_action_prefix_conditioning or self.config.action_prefix_length <= 0:
+            return 0
+
+        if self._estimated_env_dt is None or self._estimated_env_dt <= 0:
+            return 0
+
+        delay_steps = int(inference_duration_s / self._estimated_env_dt)
+        return max(0, min(self.config.action_prefix_length, delay_steps))
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
@@ -1328,16 +1457,23 @@ class PI05Policy(PreTrainedPolicy):
         )
 
         self.eval()
+        self._update_local_env_dt(time.perf_counter())
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
             predict_kwargs = {}
             if self.config.use_action_prefix_conditioning and self._last_predicted_chunk is not None:
                 predict_kwargs["prev_chunk_left_over"] = self._last_predicted_chunk[:, self.config.n_action_steps :]
+                predict_kwargs["prefix_delay_steps"] = self._estimated_local_prefix_delay_steps
 
+            inference_start = time.perf_counter()
             full_actions = self.predict_action_chunk(batch, **predict_kwargs)
+            inference_duration_s = time.perf_counter() - inference_start
             if self.config.use_action_prefix_conditioning:
                 self._last_predicted_chunk = full_actions.detach().clone()
+                self._estimated_local_prefix_delay_steps = self._estimate_local_prefix_delay_steps(
+                    inference_duration_s
+                )
 
             actions = full_actions[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
@@ -1378,8 +1514,19 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
 
+        prefix_delay_steps = None
+        if self.config.use_action_prefix_conditioning and self.config.action_prefix_length > 0:
+            prefix_delay_steps = self.model.sample_prefix_delay_steps(actions.shape[0], actions.device)
+
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            prefix_delay_steps=prefix_delay_steps,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1391,7 +1538,7 @@ class PI05Policy(PreTrainedPolicy):
             action_step_is_pad = build_prefix_step_mask(
                 batch_size=losses.shape[0],
                 chunk_size=losses.shape[1],
-                prefix_length=self.config.action_prefix_length,
+                prefix_length=prefix_delay_steps,
                 device=losses.device,
             )
 

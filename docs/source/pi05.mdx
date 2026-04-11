@@ -102,6 +102,71 @@ python src/lerobot/datasets/v30/augment_dataset_quantile_stats.py \
 
 Or train pi05 with this normalization mapping: `--policy.normalization_mapping='{"ACTION": "MEAN_STD", "STATE": "MEAN_STD", "VISUAL": "IDENTITY"}'`
 
+### Relative Actions
+
+π₀.₅ also supports **relative action training**, where the model predicts offsets from the
+current robot state instead of absolute joint values. This mirrors OpenPI's delta-action
+transform:
+
+- preprocessing: `absolute_action -> relative_action = action - state`
+- normalization: quantiles or mean/std on the **relative-action distribution**
+- postprocessing: `relative_action -> absolute_action = relative + state`
+
+To enable it:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=your_dataset \
+    --policy.type=pi05 \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.use_relative_actions=true \
+    --policy.relative_exclude_joints='["gripper"]'
+```
+
+- `relative_exclude_joints` keeps selected action dimensions absolute.
+- the training pipeline recomputes chunk-level relative-action stats for the action normalizer.
+- if you resume from pretrained processors, LeRobot rebuilds the processors from the current policy config so the relative transforms are not skipped.
+
+### Training-Time RTC / Action-Prefix Conditioning
+
+To train π₀.₅ with training-time real-time chunking (TRTC), enable action-prefix conditioning and leave overlap between `chunk_size` and `n_action_steps`:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=your_dataset \
+    --policy.type=pi05 \
+    --policy.repo_id=your_repo_id \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.use_action_prefix_conditioning=true \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=40 \
+    --policy.action_prefix_length=10
+```
+
+- `action_prefix_length` is the maximum delay, in control steps, sampled during training.
+- `n_action_steps` must be strictly smaller than `chunk_size` when action-prefix conditioning is enabled.
+- `rtc_config.enabled` and `use_action_prefix_conditioning` are mutually exclusive: the former is inference-time RTC, the latter is training-time RTC.
+
+You can combine **relative actions + TRTC**:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=your_dataset \
+    --policy.type=pi05 \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.use_relative_actions=true \
+    --policy.relative_exclude_joints='["gripper"]' \
+    --policy.use_action_prefix_conditioning=true \
+    --policy.chunk_size=40 \
+    --policy.n_action_steps=20 \
+    --policy.action_prefix_length=4
+```
+
+With this setup, TRTC prefix conditioning happens in model space on normalized relative actions,
+while the robot still receives absolute actions after postprocessing.
+
+When serving a TRTC checkpoint with [async inference](./async), set `actions_per_chunk` to the full `chunk_size` and use `aggregate_fn_name=auto` (or `latest_only` explicitly). The policy server will reuse the overlap from the previous raw action chunk and condition the next chunk on the actual async delay.
+
 ## Performance Results
 
 ### Libero Benchmark Results

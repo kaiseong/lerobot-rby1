@@ -315,7 +315,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     obs_atol: float = 1.0
-    aggregate_fn_name: str = "weighted_average"
+    aggregate_fn_name: str = "auto"
     rename_map: dict[str, str] = field(default_factory=dict)
     preprocessor_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_image_crop_applied: bool = False

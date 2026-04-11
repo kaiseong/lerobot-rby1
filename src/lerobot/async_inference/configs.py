@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.robots.config import RobotConfig
 
 from .constants import (
@@ -35,6 +37,10 @@ AGGREGATE_FUNCTIONS = {
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
 }
 
+AUTO_AGGREGATE_FN_NAME = "auto"
+AUTO_TRTC_POLICIES = {"pi0", "pi05"}
+logger = logging.getLogger(__name__)
+
 
 def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Get aggregate function by name from registry."""
@@ -42,6 +48,43 @@ def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], 
         available = list(AGGREGATE_FUNCTIONS.keys())
         raise ValueError(f"Unknown aggregate function '{name}'. Available: {available}")
     return AGGREGATE_FUNCTIONS[name]
+
+
+def resolve_aggregate_function_name(
+    aggregate_fn_name: str,
+    policy_type: str,
+    pretrained_name_or_path: str,
+) -> str:
+    if aggregate_fn_name != AUTO_AGGREGATE_FN_NAME:
+        return aggregate_fn_name
+
+    if not pretrained_name_or_path:
+        return "weighted_average"
+
+    if policy_type not in AUTO_TRTC_POLICIES:
+        return "weighted_average"
+
+    try:
+        policy_config = PreTrainedConfig.from_pretrained(pretrained_name_or_path)
+        if getattr(policy_config, "use_action_prefix_conditioning", False):
+            resolved_name = "latest_only"
+        else:
+            resolved_name = "weighted_average"
+        logger.info(
+            "Resolved aggregate_fn_name=auto to '%s' using policy config from %s",
+            resolved_name,
+            pretrained_name_or_path,
+        )
+        return resolved_name
+    except Exception as exc:  # noqa: BLE001
+        resolved_name = "latest_only" if policy_type in AUTO_TRTC_POLICIES else "weighted_average"
+        logger.warning(
+            "Falling back to aggregate_fn_name='%s' because policy config for %s could not be loaded: %s",
+            resolved_name,
+            pretrained_name_or_path,
+            exc,
+        )
+        return resolved_name
 
 
 @dataclass
@@ -184,8 +227,10 @@ class RobotClientConfig:
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
-        default="weighted_average",
-        metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
+        default=AUTO_AGGREGATE_FN_NAME,
+        metadata={
+            "help": f"Name of aggregate function to use. Options: {[AUTO_AGGREGATE_FN_NAME, *list(AGGREGATE_FUNCTIONS.keys())]}"
+        },
     )
 
     # Debug configuration
@@ -269,6 +314,11 @@ class RobotClientConfig:
                 )
             normalized_crop_params[key] = (top, left, height, width)
         self.image_crop_params = normalized_crop_params
+        self.aggregate_fn_name = resolve_aggregate_function_name(
+            self.aggregate_fn_name,
+            policy_type=self.policy_type,
+            pretrained_name_or_path=self.pretrained_name_or_path,
+        )
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod

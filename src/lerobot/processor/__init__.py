@@ -74,6 +74,12 @@ from .policy_robot_bridge import (
     PolicyActionToRobotActionProcessorStep,
     RobotActionToPolicyActionProcessorStep,
 )
+from .relative_action_processor import (
+    AbsoluteActionsProcessorStep,
+    RelativeActionsProcessorStep,
+    to_absolute_actions,
+    to_relative_actions,
+)
 from .rename_processor import RenameObservationsProcessorStep
 from .spatial_preprocess_processor import (
     ObservationImageSpatialPreprocessStep,
@@ -106,6 +112,7 @@ __all__ = [
     "make_default_robot_observation_processor",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
+    "AbsoluteActionsProcessorStep",
     "NormalizerProcessorStep",
     "Numpy2TorchActionProcessorStep",
     "ObservationProcessorStep",
@@ -119,6 +126,7 @@ __all__ = [
     "RobotActionProcessorStep",
     "RobotObservation",
     "RenameObservationsProcessorStep",
+    "RelativeActionsProcessorStep",
     "RewardClassifierProcessorStep",
     "RewardProcessorStep",
     "ObservationImageSpatialPreprocessStep",
@@ -133,6 +141,8 @@ __all__ = [
     "RobotActionToPolicyActionProcessorStep",
     "PolicyActionToRobotActionProcessorStep",
     "preprocessor_has_active_spatial_preprocess",
+    "to_absolute_actions",
+    "to_relative_actions",
     "transition_to_batch",
     "TransitionKey",
     "TruncatedProcessorStep",

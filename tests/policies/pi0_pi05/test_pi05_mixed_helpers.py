@@ -4,6 +4,7 @@ import torch
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import (
     apply_action_prefix,
+    build_action_timestep_schedule,
     build_prefix_step_mask,
     build_runtime_action_prefix,
     get_image_valid_mask,
@@ -69,13 +70,20 @@ def test_build_runtime_action_prefix_pads_to_prefix_length_and_action_dim():
         ]
     )
 
-    prefix, prefix_mask = build_runtime_action_prefix(prev_chunk_left_over, prefix_length=4, max_action_dim=3)
+    prefix, prefix_mask = build_runtime_action_prefix(
+        prev_chunk_left_over,
+        prefix_length=4,
+        max_action_dim=3,
+        chunk_size=5,
+        prefix_delay_steps=2,
+    )
 
-    assert prefix.shape == (1, 4, 3)
-    assert prefix_mask.tolist() == [[True, True, False, False]]
+    assert prefix.shape == (1, 5, 3)
+    assert prefix_mask.tolist() == [[True, True, False, False, False]]
     assert prefix[0, 0].tolist() == pytest.approx([1.0, 2.0, 0.0])
     assert prefix[0, 1].tolist() == pytest.approx([3.0, 4.0, 0.0])
     assert prefix[0, 2].tolist() == pytest.approx([0.0, 0.0, 0.0])
+    assert prefix[0, 4].tolist() == pytest.approx([0.0, 0.0, 0.0])
 
 
 def test_apply_action_prefix_overwrites_only_valid_steps():
@@ -97,6 +105,37 @@ def test_build_prefix_step_mask_marks_prefix_steps():
         [True, True, True, False, False],
         [True, True, True, False, False],
     ]
+
+
+def test_build_prefix_step_mask_supports_per_sample_lengths():
+    mask = build_prefix_step_mask(
+        batch_size=2,
+        chunk_size=5,
+        prefix_length=torch.tensor([1, 3]),
+        device=torch.device("cpu"),
+    )
+    assert mask.tolist() == [
+        [True, False, False, False, False],
+        [True, True, True, False, False],
+    ]
+
+
+def test_build_action_timestep_schedule_sets_prefix_steps_to_one():
+    timestep = torch.tensor([0.2, 0.7])
+    prefix_mask = torch.tensor(
+        [
+            [True, True, False, False],
+            [False, True, False, False],
+        ]
+    )
+    schedule = build_action_timestep_schedule(timestep, prefix_mask)
+
+    assert schedule.tolist() == pytest.approx(
+        [
+            [1.0, 1.0, 0.2, 0.2],
+            [0.7, 1.0, 0.7, 0.7],
+        ]
+    )
 
 
 def test_pi05_config_validates_action_prefix_constraints():

@@ -51,7 +51,7 @@ python -m lerobot.async_inference.robot_client \
     --policy_device=mps \ # POLICY: the device to run the policy on, on the server
     --actions_per_chunk=50 \ # POLICY: the number of actions to output at once
     --chunk_size_threshold=0.5 \ # CLIENT: the threshold for the chunk size before sending a new observation to the server
-    --aggregate_fn_name=weighted_average \ # CLIENT: the function to aggregate actions on overlapping portions
+    --aggregate_fn_name=auto \ # CLIENT: resolves to the right overlap strategy for the checkpoint
     --debug_visualize_queue_size=True # CLIENT: whether to visualize the queue size at runtime
 ```
 
@@ -65,7 +65,9 @@ In summary, you need to specify instructions for:
 Importantly,
 
 - `actions_per_chunk` and `chunk_size_threshold` are key parameters to tune for your setup.
-- `aggregate_fn_name` is the function to aggregate actions on overlapping portions. You can either add a new one to a registry of functions, or add your own in `robot_client.py` (see [here](NOTE:addlinktoLOC))
+- `aggregate_fn_name=auto` resolves to `latest_only` for checkpoints trained with action-prefix conditioning, and to `weighted_average` otherwise.
+- TRTC-style checkpoints (`use_action_prefix_conditioning=true`) require `aggregate_fn_name=latest_only` and `actions_per_chunk == chunk_size`.
+- Relative-action checkpoints are supported. The server keeps the previous raw/model-space chunk for TRTC conditioning, while the client still receives postprocessed absolute robot actions.
 - `debug_visualize_queue_size` is a useful tool to tune the `CLIENT` parameters.
 
 ## Done! You should see your robot moving around by now 😉
@@ -160,7 +162,7 @@ python -m lerobot.async_inference.robot_client \
     --policy_device=mps \ # POLICY: the device to run the policy on, on the server
     --actions_per_chunk=50 \ # POLICY: the number of actions to output at once
     --chunk_size_threshold=0.5 \ # CLIENT: the threshold for the chunk size before sending a new observation to the server
-    --aggregate_fn_name=weighted_average \ # CLIENT: the function to aggregate actions on overlapping portions
+    --aggregate_fn_name=auto \ # CLIENT: resolves to the right overlap strategy for the checkpoint
     --debug_visualize_queue_size=True # CLIENT: whether to visualize the queue size at runtime
 ```
 </hfoption>

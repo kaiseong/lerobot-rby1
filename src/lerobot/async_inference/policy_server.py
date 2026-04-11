@@ -284,10 +284,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"(got {self.actions_per_chunk} != {self.policy.config.chunk_size})"
             )
 
-        if policy_specs.aggregate_fn_name != "latest_only":
+        if policy_specs.aggregate_fn_name not in {"latest_only", "auto"}:
             raise ValueError(
                 "When use_action_prefix_conditioning is enabled for async inference, "
-                "aggregate_fn_name must be 'latest_only'."
+                "aggregate_fn_name must be 'latest_only' or 'auto'."
             )
 
     def _get_predict_action_chunk_kwargs(self, observation_timestep: int) -> dict[str, Any]:
@@ -301,8 +301,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if stride <= 0 or stride >= self._last_raw_action_chunk.shape[1]:
             return {}
 
+        prefix_delay_steps = min(
+            stride,
+            getattr(self.policy.config, "action_prefix_length", stride),
+        )
         return {
             "prev_chunk_left_over": self._last_raw_action_chunk[:, stride:],
+            "prefix_delay_steps": prefix_delay_steps,
         }
 
     def SendObservations(self, request_iterator, context):  # noqa: N802

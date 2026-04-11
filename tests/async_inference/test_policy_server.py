@@ -40,6 +40,7 @@ class MockPolicy:
         robot_type = "dummy_robot"
         use_action_prefix_conditioning = False
         chunk_size = 20
+        action_prefix_length = 4
 
         @property
         def image_features(self) -> dict[str, PolicyFeature]:
@@ -237,14 +238,30 @@ def test_predict_action_chunk(monkeypatch, policy_server):
 def test_get_predict_action_chunk_kwargs_uses_previous_chunk_overlap(policy_server):
     policy_server.policy.config.use_action_prefix_conditioning = True
     policy_server.policy.config.chunk_size = 20
+    policy_server.policy.config.action_prefix_length = 4
     policy_server._last_chunk_start_timestep = 0
     policy_server._last_raw_action_chunk = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
 
     kwargs = policy_server._get_predict_action_chunk_kwargs(10)
 
     assert "prev_chunk_left_over" in kwargs
+    assert kwargs["prefix_delay_steps"] == 4
     assert kwargs["prev_chunk_left_over"].shape == (1, 10, 1)
     assert kwargs["prev_chunk_left_over"][0, :, 0].tolist() == pytest.approx(list(range(10, 20)))
+
+
+def test_get_predict_action_chunk_kwargs_uses_actual_delay_when_smaller_than_max_prefix(policy_server):
+    policy_server.policy.config.use_action_prefix_conditioning = True
+    policy_server.policy.config.chunk_size = 20
+    policy_server.policy.config.action_prefix_length = 6
+    policy_server._last_chunk_start_timestep = 5
+    policy_server._last_raw_action_chunk = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+
+    kwargs = policy_server._get_predict_action_chunk_kwargs(8)
+
+    assert kwargs["prefix_delay_steps"] == 3
+    assert kwargs["prev_chunk_left_over"].shape == (1, 17, 1)
+    assert kwargs["prev_chunk_left_over"][0, :5, 0].tolist() == pytest.approx(list(range(3, 8)))
 
 
 def test_validate_async_policy_setup_requires_latest_only_for_trtc(policy_server):
@@ -264,6 +281,24 @@ def test_validate_async_policy_setup_requires_latest_only_for_trtc(policy_server
                 aggregate_fn_name="weighted_average",
             )
         )
+
+
+def test_validate_async_policy_setup_allows_auto_for_trtc(policy_server):
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+
+    policy_server.policy.config.use_action_prefix_conditioning = True
+    policy_server.policy.config.chunk_size = 20
+    policy_server.actions_per_chunk = 20
+
+    policy_server._validate_async_policy_setup(
+        RemotePolicyConfig(
+            policy_type="pi05",
+            pretrained_name_or_path="dummy",
+            lerobot_features=policy_server.lerobot_features,
+            actions_per_chunk=20,
+            aggregate_fn_name="auto",
+        )
+    )
 
 
 @require_package("grpcio", "grpc")

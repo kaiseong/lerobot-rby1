@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.datasets.compute_stats import compute_relative_action_stats
 from lerobot.datasets.factory import make_train_val_datasets
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
@@ -50,6 +51,7 @@ from lerobot.utils.train_utils import (
     save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.utils.constants import ACTION
 from lerobot.utils.utils import (
     format_big_number,
     has_method,
@@ -359,22 +361,47 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
+    processor_dataset_stats = dataset.meta.stats
+    if getattr(cfg.policy, "use_relative_actions", False):
+        logging.info("Computing chunk-level relative action statistics for processor normalization")
+        processor_dataset_stats = dict(dataset.meta.stats or {})
+        relative_stats_source = dataset.hf_dataset if hasattr(dataset, "hf_dataset") else dataset
+        processor_dataset_stats[ACTION] = compute_relative_action_stats(
+            hf_dataset=relative_stats_source,
+            features=dataset.meta.features,
+            chunk_size=cfg.policy.chunk_size,
+            exclude_joints=getattr(cfg.policy, "relative_exclude_joints", None),
+            num_workers=cfg.num_workers,
+        )
+
+    processor_pretrained_path = cfg.policy.pretrained_path
+    if (
+        getattr(cfg.policy, "use_relative_actions", False)
+        and processor_pretrained_path is not None
+        and not cfg.resume
+    ):
+        logging.warning(
+            "use_relative_actions=true with pretrained processors can skip relative transforms if "
+            "the checkpoint processors do not define them. Building processors from current policy config."
+        )
+        processor_pretrained_path = None
+
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
-    if (cfg.policy.pretrained_path and not cfg.resume) or not cfg.policy.pretrained_path:
+    if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
-        processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["dataset_stats"] = processor_dataset_stats
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
         processor_kwargs["dataset_meta"] = dataset.meta
 
-    if cfg.policy.pretrained_path is not None:
+    if processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": processor_dataset_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -384,7 +411,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         }
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": processor_dataset_stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -392,7 +419,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
-        pretrained_path=cfg.policy.pretrained_path,
+        pretrained_path=processor_pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )

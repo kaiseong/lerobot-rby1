@@ -52,6 +52,7 @@ def robot_client():
         policy_type="test",
         pretrained_name_or_path="test",
         actions_per_chunk=20,
+        aggregate_fn_name="weighted_average",
     )
 
     client = RobotClient(test_config)
@@ -171,6 +172,33 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
         weight_old * current_actions[1].get_action() + weight_new * incoming[-2].get_action(),
     )
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
+
+
+def test_robot_client_config_auto_resolves_latest_only_for_trtc(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    class DummyPolicyConfig:
+        use_action_prefix_conditioning = True
+
+    monkeypatch.setattr(
+        "lerobot.async_inference.configs.PreTrainedConfig.from_pretrained",
+        lambda *_args, **_kwargs: DummyPolicyConfig(),
+    )
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05-trtc",
+        actions_per_chunk=20,
+        aggregate_fn_name="auto",
+    )
+
+    assert cfg.aggregate_fn_name == "latest_only"
+    new_action = torch.tensor([2.0])
+    old_action = torch.tensor([1.0])
+    assert torch.equal(cfg.aggregate_fn(old_action, new_action), new_action)
 
 
 @pytest.mark.parametrize(
