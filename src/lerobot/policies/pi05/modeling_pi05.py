@@ -198,7 +198,9 @@ def build_action_timestep_schedule(
             f"Expected timestep shape {prefix_step_mask.shape} to match prefix mask, got {timestep.shape}"
         )
 
-    return torch.where(prefix_step_mask, torch.ones_like(timestep), timestep)
+    # PI0.5 samples from noise at time=1 toward actions at time=0. Prefix actions
+    # are already known clean actions, so expose them at the action endpoint.
+    return torch.where(prefix_step_mask, torch.zeros_like(timestep), timestep)
 
 
 def build_runtime_action_prefix(
@@ -1384,7 +1386,7 @@ class PI05Policy(PreTrainedPolicy):
         if self._estimated_env_dt is None or self._estimated_env_dt <= 0:
             return 0
 
-        delay_steps = int(inference_duration_s / self._estimated_env_dt)
+        delay_steps = math.ceil(max(0.0, inference_duration_s / self._estimated_env_dt - 1e-9))
         return max(0, min(self.config.action_prefix_length, delay_steps))
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:

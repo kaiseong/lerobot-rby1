@@ -120,7 +120,7 @@ def test_build_prefix_step_mask_supports_per_sample_lengths():
     ]
 
 
-def test_build_action_timestep_schedule_sets_prefix_steps_to_one():
+def test_build_action_timestep_schedule_sets_prefix_steps_to_action_endpoint():
     timestep = torch.tensor([0.2, 0.7])
     prefix_mask = torch.tensor(
         [
@@ -130,11 +130,14 @@ def test_build_action_timestep_schedule_sets_prefix_steps_to_one():
     )
     schedule = build_action_timestep_schedule(timestep, prefix_mask)
 
-    assert schedule.tolist() == pytest.approx(
-        [
-            [1.0, 1.0, 0.2, 0.2],
-            [0.7, 1.0, 0.7, 0.7],
-        ]
+    torch.testing.assert_close(
+        schedule,
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.2, 0.2],
+                [0.7, 0.0, 0.7, 0.7],
+            ]
+        ),
     )
 
 

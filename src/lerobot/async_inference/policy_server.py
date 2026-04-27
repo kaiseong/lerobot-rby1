@@ -25,6 +25,7 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
@@ -97,6 +98,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._apply_legacy_image_resize = True
         self._last_raw_action_chunk: torch.Tensor | None = None
         self._last_chunk_start_timestep: int | None = None
+        self._last_action_generation_duration_s = config.inference_latency
         self.payload_log_dir = self._initialize_payload_log_dir()
 
     @property
@@ -188,6 +190,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._last_raw_action_chunk = None
         self._last_chunk_start_timestep = None
+        self._last_action_generation_duration_s = self.config.inference_latency
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -301,10 +304,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if stride <= 0 or stride >= self._last_raw_action_chunk.shape[1]:
             return {}
 
-        prefix_delay_steps = min(
-            stride,
-            getattr(self.policy.config, "action_prefix_length", stride),
+        overlap_len = self._last_raw_action_chunk.shape[1] - stride
+        estimated_delay_steps = math.ceil(
+            max(0.0, self._last_action_generation_duration_s / self.config.environment_dt - 1e-9)
         )
+        prefix_delay_steps = min(
+            estimated_delay_steps,
+            getattr(self.policy.config, "action_prefix_length", stride),
+            overlap_len,
+        )
+        if prefix_delay_steps <= 0:
+            return {}
+
         return {
             "prev_chunk_left_over": self._last_raw_action_chunk[:, stride:],
             "prefix_delay_steps": prefix_delay_steps,
@@ -394,6 +405,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             time.sleep(
                 max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
             )  # sleep controls inference latency
+            self._last_action_generation_duration_s = time.perf_counter() - getactions_starts
 
             return actions
 

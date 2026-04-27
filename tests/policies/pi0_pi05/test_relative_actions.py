@@ -60,7 +60,7 @@ def test_relative_processor_caches_state_during_inference_without_actions():
 
     processed = relative_step(transition)
 
-    assert TransitionKey.ACTION not in processed
+    assert processed[TransitionKey.ACTION] is None
     torch.testing.assert_close(relative_step._last_state, state)
 
 
@@ -71,7 +71,7 @@ def test_pi05_local_prefix_delay_estimation_uses_env_dt_and_clips():
     )
 
     assert PI05Policy._estimate_local_prefix_delay_steps(dummy_policy, 0.0) == 0
-    assert PI05Policy._estimate_local_prefix_delay_steps(dummy_policy, 0.09) == 1
+    assert PI05Policy._estimate_local_prefix_delay_steps(dummy_policy, 0.09) == 2
     assert PI05Policy._estimate_local_prefix_delay_steps(dummy_policy, 0.24) == 4
 
     dummy_policy._estimated_env_dt = None

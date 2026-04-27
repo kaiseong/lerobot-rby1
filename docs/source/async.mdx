@@ -67,7 +67,8 @@ Importantly,
 - `actions_per_chunk` and `chunk_size_threshold` are key parameters to tune for your setup.
 - `aggregate_fn_name=auto` resolves to `latest_only` for checkpoints trained with action-prefix conditioning, and to `weighted_average` otherwise.
 - TRTC-style checkpoints (`use_action_prefix_conditioning=true`) require `aggregate_fn_name=latest_only` and `actions_per_chunk == chunk_size`.
-- Relative-action checkpoints are supported. The server keeps the previous raw/model-space chunk for TRTC conditioning, while the client still receives postprocessed absolute robot actions.
+- For TRTC checkpoints, the server keeps the previous raw/model-space chunk and computes the prefix delay from the measured action-generation latency in control steps.
+- Relative-action checkpoints are supported. The client still receives postprocessed absolute robot actions.
 - `debug_visualize_queue_size` is a useful tool to tune the `CLIENT` parameters.
 
 ## Done! You should see your robot moving around by now 😉

@@ -146,6 +146,7 @@ lerobot-train \
 - `action_prefix_length` is the maximum delay, in control steps, sampled during training.
 - `n_action_steps` must be strictly smaller than `chunk_size` when action-prefix conditioning is enabled.
 - `rtc_config.enabled` and `use_action_prefix_conditioning` are mutually exclusive: the former is inference-time RTC, the latter is training-time RTC.
+- Internally, π₀.₅ samples from noise at flow time `1` toward actions at flow time `0`, so TRTC prefixes are injected as clean actions with prefix flow time `0`.
 
 You can combine **relative actions + TRTC**:
 

@@ -235,12 +235,13 @@ def test_predict_action_chunk(monkeypatch, policy_server):
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
 
 
-def test_get_predict_action_chunk_kwargs_uses_previous_chunk_overlap(policy_server):
+def test_get_predict_action_chunk_kwargs_uses_latency_delay_clamped_to_max_prefix(policy_server):
     policy_server.policy.config.use_action_prefix_conditioning = True
     policy_server.policy.config.chunk_size = 20
     policy_server.policy.config.action_prefix_length = 4
     policy_server._last_chunk_start_timestep = 0
     policy_server._last_raw_action_chunk = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+    policy_server._last_action_generation_duration_s = 9.5 * policy_server.config.environment_dt
 
     kwargs = policy_server._get_predict_action_chunk_kwargs(10)
 
@@ -250,12 +251,13 @@ def test_get_predict_action_chunk_kwargs_uses_previous_chunk_overlap(policy_serv
     assert kwargs["prev_chunk_left_over"][0, :, 0].tolist() == pytest.approx(list(range(10, 20)))
 
 
-def test_get_predict_action_chunk_kwargs_uses_actual_delay_when_smaller_than_max_prefix(policy_server):
+def test_get_predict_action_chunk_kwargs_uses_latency_delay_when_smaller_than_max_prefix(policy_server):
     policy_server.policy.config.use_action_prefix_conditioning = True
     policy_server.policy.config.chunk_size = 20
     policy_server.policy.config.action_prefix_length = 6
     policy_server._last_chunk_start_timestep = 5
     policy_server._last_raw_action_chunk = torch.arange(20, dtype=torch.float32).view(1, 20, 1)
+    policy_server._last_action_generation_duration_s = 2.5 * policy_server.config.environment_dt
 
     kwargs = policy_server._get_predict_action_chunk_kwargs(8)
 
