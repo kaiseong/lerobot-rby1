@@ -26,8 +26,10 @@ import numpy as np
 import pytest
 import torch
 
-# Skip entire module if grpc is not available
+# Skip entire module if required deps are not available
 pytest.importorskip("grpc")
+pytest.importorskip("serial", reason="pyserial is required (install lerobot[hardware])")
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 # -----------------------------------------------------------------------------
 # Test fixtures
@@ -419,8 +421,6 @@ def test_robot_client_registers_builtin_robot_types():
             f"Ensure the corresponding module is imported in robot_client.py. "
             f"Known choices: {sorted(known_choices)}"
         )
-
-
 def test_robot_client_passes_obs_atol_to_remote_policy_config():
     """Client config should propagate observation similarity tolerance to the server setup payload."""
     from lerobot.async_inference.configs import RobotClientConfig

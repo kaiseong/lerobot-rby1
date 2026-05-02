@@ -11,8 +11,7 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 
 from lerobot.configs.default import DatasetSourceConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import DEFAULT_FEATURES
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, OBS_STATE
 
 RBY1_RIGHT_ARM_LEGACY_ADAPTER = "rby1_right_arm_legacy"
 RBY1_BIMANUAL_TORSO_ADAPTER = "rby1_bimanual_torso"

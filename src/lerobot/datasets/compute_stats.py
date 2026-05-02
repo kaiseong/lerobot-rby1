@@ -13,12 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging
 
 import numpy as np
 
-from lerobot.datasets.utils import load_image_as_numpy
+from lerobot.processor import RelativeActionsProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
+
+from .io_utils import load_image_as_numpy
 
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
@@ -630,7 +634,7 @@ def aggregate_stats(stats_list: list[dict[str, dict]]) -> dict[str, dict[str, np
 
 
 def _get_valid_chunk_starts(episode_indices: np.ndarray, chunk_size: int) -> np.ndarray:
-    """Return start indices where a full chunk stays inside one episode."""
+    """Return all start indices where a chunk of ``chunk_size`` stays within one episode."""
     total = len(episode_indices)
     if total < chunk_size:
         return np.array([], dtype=np.int64)
@@ -647,10 +651,12 @@ def _compute_relative_chunk_batch(
     chunk_size: int,
     relative_mask: np.ndarray,
 ) -> np.ndarray:
-    """Vectorized relative-action computation for a batch of chunk starts."""
+    """Vectorised relative-action computation for a batch of start indices.
+
+    Returns an ``(N * chunk_size, action_dim)`` float32 array.
+    """
     if len(start_indices) == 0:
         return np.empty((0, all_actions.shape[1]), dtype=np.float32)
-
     offsets = np.arange(chunk_size)
     frame_idx = start_indices[:, None] + offsets[None, :]
     chunks = all_actions[frame_idx].copy()
@@ -667,9 +673,31 @@ def compute_relative_action_stats(
     exclude_joints: list[str] | None = None,
     num_workers: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Compute per-dimension statistics for chunk-level relative actions."""
-    from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+    """Compute normalization statistics for relative actions over the full dataset.
 
+    Iterates *all* valid action chunks (within single episodes), converts them to
+    relative actions (action − current_state), and computes per-dimension
+    statistics suitable for normalization.
+
+    Args:
+        hf_dataset: The underlying HuggingFace dataset with "action",
+            "observation.state", and "episode_index" columns.
+        features: Dataset feature metadata (must contain "action" with "shape"
+            and optionally "names").
+        chunk_size: Number of consecutive frames per action chunk.
+        exclude_joints: Joint names whose dimensions should remain absolute
+            (not converted to relative actions).
+        num_workers: Number of parallel threads for computation. Values ≤1
+            mean single-threaded. Numpy releases the GIL so threads give
+            real parallelism here.
+
+    Returns:
+        Statistics dict with keys "mean", "std", "min", "max", "q01", …, "q99".
+
+    Raises:
+        ValueError: If the dataset has fewer frames than ``chunk_size``.
+        RuntimeError: If no valid (single-episode) chunks are found.
+    """
     if exclude_joints is None:
         exclude_joints = []
 
@@ -749,13 +777,10 @@ def compute_relative_action_stats(
     excluded_dims = int(len(relative_mask) - relative_mask.sum())
     total_frames = len(valid_starts) * chunk_size
     logging.info(
-        "Relative action stats (%s chunks, %s frames): relative_dims=%s/%s (excluded=%s), mean=%.4f, std=%.4f",
-        len(valid_starts),
-        total_frames,
-        int(relative_mask.sum()),
-        len(relative_mask),
-        excluded_dims,
-        np.abs(stats["mean"]).mean(),
-        stats["std"].mean(),
+        f"Relative action stats ({len(valid_starts)} chunks, {total_frames} frames): "
+        f"relative_dims={int(relative_mask.sum())}/{len(relative_mask)} (excluded={excluded_dims}), "
+        f"mean={np.abs(stats['mean']).mean():.4f}, std={stats['std'].mean():.4f}, "
+        f"q01={stats['q01'].mean():.4f}, q99={stats['q99'].mean():.4f}"
     )
+
     return stats

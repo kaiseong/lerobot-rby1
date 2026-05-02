@@ -17,6 +17,18 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from lerobot.common.train_utils import (
+    build_saved_inference_preprocessor,
+    get_step_checkpoint_dir,
+    get_step_identifier,
+    get_training_spatial_preprocess_override,
+    load_training_state,
+    load_training_step,
+    save_checkpoint,
+    save_training_state,
+    save_training_step,
+    update_last_checkpoint,
+)
 from lerobot.configs.default import DatasetConfig, DatasetCropConfig, DatasetResizePadConfig
 from lerobot.processor import IdentityProcessorStep, PolicyProcessorPipeline
 from lerobot.utils.constants import (
@@ -28,18 +40,6 @@ from lerobot.utils.constants import (
     SCHEDULER_STATE,
     TRAINING_STATE_DIR,
     TRAINING_STEP,
-)
-from lerobot.utils.train_utils import (
-    build_saved_inference_preprocessor,
-    get_step_checkpoint_dir,
-    get_step_identifier,
-    get_training_spatial_preprocess_override,
-    load_training_state,
-    load_training_step,
-    save_checkpoint,
-    save_training_state,
-    save_training_step,
-    update_last_checkpoint,
 )
 
 
@@ -76,7 +76,7 @@ def test_update_last_checkpoint(tmp_path):
     assert last_checkpoint.resolve() == checkpoint
 
 
-@patch("lerobot.utils.train_utils.save_training_state")
+@patch("lerobot.common.train_utils.save_training_state")
 def test_save_checkpoint(mock_save_training_state, tmp_path, optimizer):
     policy = Mock()
     cfg = Mock()
@@ -86,7 +86,7 @@ def test_save_checkpoint(mock_save_training_state, tmp_path, optimizer):
     mock_save_training_state.assert_called_once()
 
 
-@patch("lerobot.utils.train_utils.save_training_state")
+@patch("lerobot.common.train_utils.save_training_state")
 def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     policy = Mock()
     policy.config = Mock()
@@ -100,7 +100,7 @@ def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     mock_save_training_state.assert_called_once()
 
 
-@patch("lerobot.utils.train_utils.save_training_state")
+@patch("lerobot.common.train_utils.save_training_state")
 def test_save_checkpoint_injects_saved_crop_preprocessor(mock_save_training_state, tmp_path, optimizer):
     policy = Mock()
     cfg = Mock()

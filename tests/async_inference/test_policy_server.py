@@ -25,7 +25,7 @@ import torch
 
 from lerobot.configs.types import PolicyFeature
 from lerobot.utils.constants import OBS_STATE
-from tests.utils import require_package
+from tests.utils import skip_if_package_missing
 
 # -----------------------------------------------------------------------------
 # Test fixtures
@@ -66,7 +66,7 @@ class MockPolicy:
 
 
 @pytest.fixture
-@require_package("grpcio", "grpc")
+@skip_if_package_missing("grpcio", "grpc")
 def policy_server():
     """Fresh `PolicyServer` instance with a stubbed-out policy model."""
     # Import only when the test actually runs (after decorator check)
@@ -303,7 +303,7 @@ def test_validate_async_policy_setup_allows_auto_for_trtc(policy_server):
     )
 
 
-@require_package("grpcio", "grpc")
+@skip_if_package_missing("grpcio", "grpc")
 def test_predict_action_chunk_logs_payloads(monkeypatch, tmp_path):
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import PolicyServer

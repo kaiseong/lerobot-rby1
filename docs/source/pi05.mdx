@@ -36,11 +36,6 @@ This diverse training mixture creates a "curriculum" that enables generalization
    pip install -e ".[pi]"
    ```
 
-   > [!NOTE]
-   > For lerobot 0.4.0, if you want to install pi tag, you will have to do: `pip install "lerobot[pi]@git+https://github.com/huggingface/lerobot.git"`.
-   >
-   > This will be solved in the next patch release
-
 ## Usage
 
 To use π₀.₅ in your LeRobot configuration, specify the policy type as:
@@ -113,6 +108,20 @@ transform:
 - postprocessing: `relative_action -> absolute_action = relative + state`
 
 To enable it:
+
+First recompute your dataset stats in relative space:
+
+```bash
+lerobot-edit-dataset \
+    --repo_id your_dataset \
+    --operation.type recompute_stats \
+    --operation.relative_action true \
+    --operation.chunk_size 50 \
+    --operation.relative_exclude_joints "['gripper']" \
+    --push_to_hub true
+```
+
+Then train with relative actions enabled:
 
 ```bash
 lerobot-train \

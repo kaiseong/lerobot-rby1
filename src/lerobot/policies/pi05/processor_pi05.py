@@ -21,8 +21,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs.types import PipelineFeatureType, PolicyFeature
-from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
@@ -36,14 +35,17 @@ from lerobot.processor import (
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
+    policy_action_to_transition,
+    transition_to_policy_action,
 )
-from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
-from lerobot.processor.core import EnvTransition, TransitionKey
+from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+from .configuration_pi05 import PI05Config
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -79,6 +81,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
+        # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
+        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         state_np = state.cpu().numpy()
         state_is_pad_np = state_is_pad.cpu().numpy()
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
@@ -141,7 +145,7 @@ def make_pi05_pre_post_processors(
         action_names=getattr(config, "action_feature_names", None),
     )
 
-    # OpenPI order: raw -> relative -> normalize -> tokenize -> model -> unnormalize -> absolute
+    # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),

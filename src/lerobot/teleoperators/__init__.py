@@ -20,8 +20,8 @@ from .leader_arm import Rby1LeaderArm, Rby1LeaderArmConfig
 from .utils import TeleopEvents, make_teleoperator_from_config
 
 __all__ = [
-    "TeleoperatorConfig",
     "Teleoperator",
+    "TeleoperatorConfig",
     "TeleopEvents",
     "make_teleoperator_from_config",
     "Rby1LeaderArm",
