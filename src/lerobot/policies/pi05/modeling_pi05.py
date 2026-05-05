@@ -15,35 +15,39 @@
 # limitations under the License.
 
 import builtins
+import copy
 import logging
 import math
+import time
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
-from typing_extensions import Unpack
 
-from lerobot.utils.import_utils import _transformers_available
+from lerobot.utils.import_utils import _transformers_available, require_package
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
-    from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
-    from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
+
+    from ..pi_gemma import (
+        PaliGemmaForConditionalGenerationWithPiGemma,
+        PiGemmaForCausalLM,
+        _gated_residual,
+        layernorm_forward,
+    )
 else:
     CONFIG_MAPPING = None
     modeling_gemma = None
-    GemmaForCausalLM = None
-    PaliGemmaForConditionalGeneration = None
-
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
-from lerobot.policies.pretrained import PreTrainedPolicy, T
-from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+    PiGemmaForCausalLM = None
+    _gated_residual = None
+    layernorm_forward = None
+    PaliGemmaForConditionalGenerationWithPiGemma = None
+from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -51,11 +55,16 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+from ..pretrained import PreTrainedPolicy, T
+from ..rtc.modeling_rtc import RTCProcessor
+from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    prefix_delay_steps: int | Tensor | None
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -74,12 +83,12 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Computes sine-cosine positional embedding vectors for scalar or token-wise positions."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor is expected to be of shape `(batch_size,)` or `(batch_size, steps)`.")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
@@ -87,15 +96,20 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    if time.ndim == 1:
+        sin_input = scaling_factor[None, :] * time[:, None]
+        return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+
+    sin_input = scaling_factor[None, None, :] * time[:, :, None]
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
-    alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
-    beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
+    # Beta sampling uses _sample_dirichlet which isn't implemented for MPS, so sample on CPU
+    alpha_t = torch.tensor(alpha, dtype=torch.float32)
+    beta_t = torch.tensor(beta, dtype=torch.float32)
     dist = torch.distributions.Beta(alpha_t, beta_t)
-    return dist.sample((bsize,))
+    return dist.sample((bsize,)).to(device)
 
 
 def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (exact copy)
@@ -141,21 +155,70 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
-def build_prefix_step_mask(batch_size: int, chunk_size: int, prefix_length: int, device: torch.device) -> Tensor | None:
-    if prefix_length <= 0:
+def build_prefix_step_mask(
+    batch_size: int,
+    chunk_size: int,
+    prefix_length: int | Tensor | None,
+    device: torch.device,
+) -> Tensor | None:
+    if prefix_length is None:
         return None
 
-    step_mask = torch.zeros((batch_size, chunk_size), dtype=torch.bool, device=device)
-    step_mask[:, :prefix_length] = True
-    return step_mask
+    if isinstance(prefix_length, torch.Tensor):
+        prefix_lengths = prefix_length.to(device=device, dtype=torch.long)
+    else:
+        if prefix_length <= 0:
+            return None
+        prefix_lengths = torch.full((batch_size,), prefix_length, dtype=torch.long, device=device)
+
+    if prefix_lengths.ndim == 0:
+        prefix_lengths = prefix_lengths.expand(batch_size)
+    elif prefix_lengths.numel() == 1:
+        prefix_lengths = prefix_lengths.reshape(1).expand(batch_size)
+    else:
+        prefix_lengths = prefix_lengths.reshape(batch_size)
+
+    prefix_lengths = prefix_lengths.clamp(min=0, max=chunk_size)
+    if prefix_lengths.max().item() == 0:
+        return None
+
+    steps = torch.arange(chunk_size, device=device).unsqueeze(0)
+    return steps < prefix_lengths.unsqueeze(1)
+
+
+def build_action_timestep_schedule(
+    timestep: Tensor,
+    prefix_step_mask: Tensor | None,
+) -> Tensor:
+    if prefix_step_mask is None:
+        return timestep
+
+    if timestep.ndim == 0:
+        timestep = timestep.unsqueeze(0)
+
+    if timestep.ndim == 1:
+        timestep = timestep[:, None].expand(-1, prefix_step_mask.shape[1]).clone()
+    elif timestep.ndim != 2:
+        raise ValueError("Expected timestep to be rank-1 or rank-2 when prefix conditioning is enabled.")
+
+    if timestep.shape != prefix_step_mask.shape:
+        raise ValueError(
+            f"Expected timestep shape {prefix_step_mask.shape} to match prefix mask, got {timestep.shape}"
+        )
+
+    # PI0.5 samples from noise at time=1 toward actions at time=0. Prefix actions
+    # are already known clean actions, so expose them at the action endpoint.
+    return torch.where(prefix_step_mask, torch.zeros_like(timestep), timestep)
 
 
 def build_runtime_action_prefix(
     prev_chunk_left_over: Tensor | None,
     prefix_length: int,
     max_action_dim: int,
+    chunk_size: int,
+    prefix_delay_steps: int | Tensor | None = None,
 ) -> tuple[Tensor | None, Tensor | None]:
-    if prev_chunk_left_over is None or prefix_length <= 0:
+    if prev_chunk_left_over is None or prefix_length <= 0 or chunk_size <= 0:
         return None, None
 
     if prev_chunk_left_over.ndim == 2:
@@ -163,17 +226,35 @@ def build_runtime_action_prefix(
 
     batch_size = prev_chunk_left_over.shape[0]
     device = prev_chunk_left_over.device
-    action_prefix_mask = torch.zeros((batch_size, prefix_length), dtype=torch.bool, device=device)
-
-    available_steps = min(prefix_length, prev_chunk_left_over.shape[1])
-    action_prefix_mask[:, :available_steps] = True
-
-    if available_steps == 0:
+    requested_mask = build_prefix_step_mask(
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        prefix_length=prefix_length if prefix_delay_steps is None else prefix_delay_steps,
+        device=device,
+    )
+    if requested_mask is None:
         return None, None
 
-    action_prefix = pad_vector(prev_chunk_left_over[:, :available_steps], max_action_dim)
-    if available_steps < prefix_length:
-        action_prefix = F.pad(action_prefix, (0, 0, 0, prefix_length - available_steps))
+    available_mask = build_prefix_step_mask(
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        prefix_length=min(chunk_size, prev_chunk_left_over.shape[1]),
+        device=device,
+    )
+    if available_mask is None:
+        return None, None
+
+    action_prefix_mask = requested_mask & available_mask
+    if not action_prefix_mask.any():
+        return None, None
+
+    action_prefix = torch.zeros(
+        (batch_size, chunk_size, max_action_dim),
+        dtype=prev_chunk_left_over.dtype,
+        device=device,
+    )
+    available_steps = min(chunk_size, prev_chunk_left_over.shape[1])
+    action_prefix[:, :available_steps] = pad_vector(prev_chunk_left_over[:, :available_steps], max_action_dim)
 
     return action_prefix, action_prefix_mask
 
@@ -248,7 +329,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     if images.dtype == torch.uint8:
         resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
     elif images.dtype == torch.float32:
-        resized_images = resized_images.clamp(-1.0, 1.0)
+        resized_images = resized_images.clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unsupported image dtype: {images.dtype}")
 
@@ -259,7 +340,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     pad_w1 = pad_w0 + remainder_w
 
     # Pad
-    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    constant_value = 0 if images.dtype == torch.uint8 else 0.0
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
@@ -331,14 +412,14 @@ def reduce_action_losses(
 def compute_layer_complete(
     layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, paligemma, gemma_expert
 ):
-    models = [paligemma.language_model, gemma_expert.model]
+    models = [paligemma.model.language_model, gemma_expert.model]
     query_states = []
     key_states = []
     value_states = []
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        hidden_states, gate = layernorm_forward(layer.input_layernorm, hidden_states, adarms_cond[i])
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -364,10 +445,10 @@ def compute_layer_complete(
         query_states, key_states, cos, sin, unsqueeze_dim=1
     )
     batch_size = query_states.shape[0]
-    scaling = paligemma.language_model.layers[layer_idx].self_attn.scaling
+    scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
     # Attention computation
     att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.language_model.layers[layer_idx].self_attn,
+        paligemma.model.language_model.layers[layer_idx].self_attn,
         query_states,
         key_states,
         value_states,
@@ -375,7 +456,7 @@ def compute_layer_complete(
         scaling,
     )
     # Get head_dim from the current layer, not from the model
-    head_dim = paligemma.language_model.layers[layer_idx].self_attn.head_dim
+    head_dim = paligemma.model.language_model.layers[layer_idx].self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
     # Process layer outputs
     outputs_embeds = []
@@ -387,15 +468,15 @@ def compute_layer_complete(
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         # first residual
-        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+        out_emb = _gated_residual(hidden_states, out_emb, gates[i])
         after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
         # second residual
-        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+        out_emb = _gated_residual(after_first_residual, out_emb, gate)
         outputs_embeds.append(out_emb)
         start_pos = end_pos
     return outputs_embeds
@@ -468,7 +549,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
         vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
         vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        vlm_config_hf.text_config.torch_dtype = "float32"
+        vlm_config_hf.text_config.dtype = "float32"
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
@@ -476,7 +557,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_config_hf.vision_config.torch_dtype = "float32"
+        vlm_config_hf.vision_config.dtype = "float32"
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -487,13 +568,13 @@ class PaliGemmaWithExpertModel(
             num_key_value_heads=action_expert_config.num_kv_heads,
             vocab_size=257152,
             hidden_activation="gelu_pytorch_tanh",
-            torch_dtype="float32",
+            dtype="float32",
             use_adarms=use_adarms[1],
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+        self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
+        self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
@@ -508,10 +589,11 @@ class PaliGemmaWithExpertModel(
         else:
             raise ValueError(f"Invalid precision: {precision}")
 
+        # Keep full vision path in float32 so we never toggle (toggle causes optimizer
+        # "same dtype" error). Saves memory vs full float32; more memory than only 3 params.
         params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
+            "vision_tower",
+            "multi_modal_projector",
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
@@ -523,8 +605,8 @@ class PaliGemmaWithExpertModel(
 
     def _set_requires_grad(self):
         if self.freeze_vision_encoder:
-            self.paligemma.vision_tower.eval()
-            for param in self.paligemma.vision_tower.parameters():
+            self.paligemma.model.vision_tower.eval()
+            for param in self.paligemma.model.vision_tower.parameters():
                 param.requires_grad = False
         if self.train_expert_only:
             self.paligemma.eval()
@@ -534,15 +616,23 @@ class PaliGemmaWithExpertModel(
     def train(self, mode: bool = True):
         super().train(mode)
         if self.freeze_vision_encoder:
-            self.paligemma.vision_tower.eval()
+            self.paligemma.model.vision_tower.eval()
         if self.train_expert_only:
             self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
+        out_dtype = image.dtype
+        if image.dtype != torch.float32:
+            image = image.to(torch.float32)
+        image_outputs = self.paligemma.model.get_image_features(image)
+        features = image_outputs.pooler_output * self.paligemma.config.text_config.hidden_size**0.5
+        if features.dtype != out_dtype:
+            features = features.to(out_dtype)
+        return features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.language_model.embed_tokens(tokens)
+        return self.paligemma.model.language_model.embed_tokens(tokens)
 
     def forward(
         self,
@@ -556,7 +646,7 @@ class PaliGemmaWithExpertModel(
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.language_model.forward(
+            prefix_output = self.paligemma.model.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -580,7 +670,7 @@ class PaliGemmaWithExpertModel(
             prefix_output = None
             prefix_past_key_values = None
         else:
-            models = [self.paligemma.language_model, self.gemma_expert.model]
+            models = [self.paligemma.model.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
             # Check if gradient checkpointing is enabled for any of the models
@@ -620,7 +710,7 @@ class PaliGemmaWithExpertModel(
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    out_emb, _ = layernorm_forward(models[i].norm, hidden_states, adarms_cond[i])
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
@@ -685,29 +775,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
-        msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
-
-        try:
-            from transformers.models.siglip import check
-
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
-
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
@@ -742,6 +822,16 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
         return time.to(dtype=torch.float32, device=device)
+
+    def sample_prefix_delay_steps(self, bsize: int, device: torch.device) -> Tensor | None:
+        if not self.config.use_action_prefix_conditioning or self.config.action_prefix_length <= 0:
+            return None
+        return torch.randint(
+            low=0,
+            high=self.config.action_prefix_length + 1,
+            size=(bsize,),
+            device=device,
+        )
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
@@ -833,22 +923,33 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise,
+        time,
+        prefix_delay_steps: Tensor | None = None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
 
+        prefix_step_mask = None
         if self.config.use_action_prefix_conditioning and self.config.action_prefix_length > 0:
-            x_t = apply_action_prefix(
-                x_t,
-                actions[:, : self.config.action_prefix_length],
+            if prefix_delay_steps is None:
+                prefix_delay_steps = self.sample_prefix_delay_steps(actions.shape[0], actions.device)
+            prefix_step_mask = build_prefix_step_mask(
+                batch_size=actions.shape[0],
+                chunk_size=self.config.chunk_size,
+                prefix_length=prefix_delay_steps,
+                device=actions.device,
             )
+            x_t = apply_action_prefix(x_t, actions, prefix_step_mask)
+            time = build_action_timestep_schedule(time, prefix_step_mask)
 
         u_t = noise - actions
 
@@ -856,7 +957,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
@@ -923,12 +1024,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         action_prefix = None
-        action_prefix_mask = None
+        prefix_step_mask = None
         if self.config.use_action_prefix_conditioning:
-            action_prefix, action_prefix_mask = build_runtime_action_prefix(
+            action_prefix, prefix_step_mask = build_runtime_action_prefix(
                 kwargs.get("prev_chunk_left_over"),
                 self.config.action_prefix_length,
                 self.config.max_action_dim,
+                chunk_size=self.config.chunk_size,
+                prefix_delay_steps=kwargs.get("prefix_delay_steps"),
             )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
@@ -936,7 +1039,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -948,12 +1051,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         dt = -1.0 / num_steps
 
-        x_t = apply_action_prefix(noise, action_prefix, action_prefix_mask)
+        x_t = apply_action_prefix(noise, action_prefix, prefix_step_mask)
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            time_schedule = build_action_timestep_schedule(time_tensor, prefix_step_mask)
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+            def denoise_step_partial_call(input_x_t, current_timestep=time_schedule):
                 return self.denoise_step(
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
@@ -978,7 +1082,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
-            x_t = apply_action_prefix(x_t, action_prefix, action_prefix_mask)
+            x_t = apply_action_prefix(x_t, action_prefix, prefix_step_mask)
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -1009,6 +1113,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
+        past_key_values = copy.deepcopy(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -1039,6 +1144,7 @@ class PI05Policy(PreTrainedPolicy):
         Args:
             config: Policy configuration class instance.
         """
+        require_package("transformers", extra="pi")
         super().__init__(config)
         config.validate_features()
         self.config = config
@@ -1098,35 +1204,33 @@ class PI05Policy(PreTrainedPolicy):
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
 
-        # Now manually load and remap the state dict
+        # Load state dict (expects keys with "model." prefix)
         try:
-            # Try to load the pytorch_model.bin or model.safetensors file
             print(f"Loading model from: {pretrained_name_or_path}")
             try:
                 from transformers.utils import cached_file
 
-                # Try safetensors first
                 resolved_file = cached_file(
                     pretrained_name_or_path,
                     "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    use_auth_token=kwargs.get("use_auth_token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    revision=revision,
+                    local_files_only=local_files_only,
                 )
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+                raise FileNotFoundError(
+                    f"Could not load model.safetensors from {pretrained_name_or_path}"
+                ) from e
 
-            # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
+            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
 
             # Then add "model." prefix for all keys that don't already have it
@@ -1138,8 +1242,6 @@ class PI05Policy(PreTrainedPolicy):
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
-                    if remap_count <= 10:  # Only print first 10 to avoid spam
-                        print(f"Remapped: {key} -> {new_key}")
                 else:
                     remapped_state_dict[key] = value
 
@@ -1173,7 +1275,7 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not remap state dict keys: {e}")
+            raise RuntimeError(f"Could not load PI05 weights from {pretrained_name_or_path}") from e
 
         return model
 
@@ -1215,10 +1317,14 @@ class PI05Policy(PreTrainedPolicy):
             # pi05 model expects time_mlp_*, but checkpoint might have action_time_mlp_*
             if key.startswith("action_time_mlp_in."):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
+            elif key.startswith("model.action_time_mlp_in."):
+                new_key = key.replace("model.action_time_mlp_in.", "model.time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
+            elif key.startswith("model.action_time_mlp_out."):
+                new_key = key.replace("model.action_time_mlp_out.", "model.time_mlp_out.")
             # Also handle state_proj which shouldn't exist in pi05
-            if key.startswith("state_proj."):
+            if key.startswith("state_proj.") or key.startswith("model.state_proj."):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
@@ -1226,6 +1332,14 @@ class PI05Policy(PreTrainedPolicy):
             if "patch_embedding" in key:
                 # Some checkpoints might have this, but current model expects different structure
                 logging.warning(f"Vision embedding key might need handling: {key}")
+
+            if (
+                key == "model.paligemma_with_expert.paligemma.lm_head.weight"
+                or key == "paligemma_with_expert.paligemma.lm_head.weight"
+            ):
+                fixed_state_dict[
+                    "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+                ] = value.clone()
 
             fixed_state_dict[new_key] = value
 
@@ -1238,6 +1352,9 @@ class PI05Policy(PreTrainedPolicy):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
         self._last_predicted_chunk = None
+        self._estimated_env_dt = None
+        self._last_select_action_time = None
+        self._estimated_local_prefix_delay_steps = 0
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
@@ -1257,6 +1374,31 @@ class PI05Policy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _update_local_env_dt(self, now_s: float) -> None:
+        if self._last_select_action_time is None:
+            self._last_select_action_time = now_s
+            return
+
+        delta = now_s - self._last_select_action_time
+        self._last_select_action_time = now_s
+        if delta <= 0:
+            return
+
+        if self._estimated_env_dt is None:
+            self._estimated_env_dt = delta
+        else:
+            self._estimated_env_dt = 0.9 * self._estimated_env_dt + 0.1 * delta
+
+    def _estimate_local_prefix_delay_steps(self, inference_duration_s: float) -> int:
+        if not self.config.use_action_prefix_conditioning or self.config.action_prefix_length <= 0:
+            return 0
+
+        if self._estimated_env_dt is None or self._estimated_env_dt <= 0:
+            return 0
+
+        delay_steps = math.ceil(max(0.0, inference_duration_s / self._estimated_env_dt - 1e-9))
+        return max(0, min(self.config.action_prefix_length, delay_steps))
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
@@ -1328,16 +1470,23 @@ class PI05Policy(PreTrainedPolicy):
         )
 
         self.eval()
+        self._update_local_env_dt(time.perf_counter())
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
             predict_kwargs = {}
             if self.config.use_action_prefix_conditioning and self._last_predicted_chunk is not None:
                 predict_kwargs["prev_chunk_left_over"] = self._last_predicted_chunk[:, self.config.n_action_steps :]
+                predict_kwargs["prefix_delay_steps"] = self._estimated_local_prefix_delay_steps
 
+            inference_start = time.perf_counter()
             full_actions = self.predict_action_chunk(batch, **predict_kwargs)
+            inference_duration_s = time.perf_counter() - inference_start
             if self.config.use_action_prefix_conditioning:
                 self._last_predicted_chunk = full_actions.detach().clone()
+                self._estimated_local_prefix_delay_steps = self._estimate_local_prefix_delay_steps(
+                    inference_duration_s
+                )
 
             actions = full_actions[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
@@ -1378,8 +1527,23 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.prepare_action(batch)
 
+        noise = self.model.sample_noise(actions.shape, actions.device)
+        time = self.model.sample_time(actions.shape[0], actions.device)
+        prefix_delay_steps = None
+        if self.config.use_action_prefix_conditioning and self.config.action_prefix_length > 0:
+            prefix_delay_steps = self.model.sample_prefix_delay_steps(actions.shape[0], actions.device)
+
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            noise,
+            time,
+            prefix_delay_steps=prefix_delay_steps,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1391,7 +1555,7 @@ class PI05Policy(PreTrainedPolicy):
             action_step_is_pad = build_prefix_step_mask(
                 batch_size=losses.shape[0],
                 chunk_size=losses.shape[1],
-                prefix_length=self.config.action_prefix_length,
+                prefix_length=prefix_delay_steps,
                 device=losses.device,
             )
 
@@ -1414,9 +1578,7 @@ class PI05Policy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
+        common_projections = "action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

@@ -22,4 +22,4 @@ from .utils import make_robot_from_config
 # Import only the config module to avoid pulling in robot runtime dependencies here.
 from .rby1.config_rby1 import Rby1Config
 
-__all__ = ["RobotConfig", "Robot", "make_robot_from_config", "Rby1Config"]
+__all__ = ["Robot", "RobotConfig", "make_robot_from_config", "Rby1Config"]

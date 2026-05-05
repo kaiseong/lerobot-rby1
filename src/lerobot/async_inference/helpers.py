@@ -23,9 +23,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from lerobot.configs.types import PolicyFeature
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
-from lerobot.utils.image_preprocessing import apply_observation_crops, crop_raw_observation_image
+from lerobot.configs import PolicyFeature
+from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 
 # NOTE: Configs need to be loaded for the client to be able to instantiate the policy config
 from lerobot.policies import (  # noqa: F401
@@ -38,6 +37,7 @@ from lerobot.policies import (  # noqa: F401
 )
 from lerobot.robots.robot import Robot
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.utils import init_logging
 
 Action = torch.Tensor
@@ -315,7 +315,7 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     obs_atol: float = 1.0
-    aggregate_fn_name: str = "weighted_average"
+    aggregate_fn_name: str = "auto"
     rename_map: dict[str, str] = field(default_factory=dict)
     preprocessor_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     client_image_crop_applied: bool = False

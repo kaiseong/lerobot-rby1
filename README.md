@@ -4,7 +4,8 @@
 
 <div align="center">
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
+[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
+[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
 [![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
 [![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
@@ -35,6 +36,146 @@ lerobot-info
 
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+
+## Current Branch Focus: Pi0.5 TRTC on LeRobot 0.5.2
+
+This branch is based on LeRobot `0.5.2` and focuses on a practical pi0.5 deployment path for real robots:
+
+- **Dataset edge trimming:** `lerobot-edit-dataset` can trim fixed-duration episode edges and stationary start/end plateaus detected from robot state.
+- **Pi0.5 training-time RTC (TRTC):** pi0.5 supports action-prefix conditioning during training, including clean prefix injection, per-action flow timesteps, and prefix-step loss masking.
+- **Full fine-tuning path:** the TRTC path works with normal full fine-tuning; PEFT is optional and not required.
+- **Async inference compatibility:** TRTC checkpoints can be served through LeRobot `async_inference` by using full chunks and `latest_only` aggregation.
+- **Safer pi0.5 loading:** pi0.5 checkpoint loading now fails loudly if weights cannot be loaded instead of silently returning an uninitialized model.
+
+Recommended workflow for this branch:
+
+1. Trim recorded episodes, especially idle plateaus at the start and end.
+2. Fine-tune pi0.5 with `use_action_prefix_conditioning=true`.
+3. Serve the trained checkpoint with `async_inference` using `actions_per_chunk == policy.chunk_size`.
+
+## Dataset Preparation: Trim Idle Episode Edges
+
+For robot demonstrations with idle frames at the beginning or end, use stationary edge trimming before training. This rebuilds the dataset episode-by-episode so frame indices, timestamps, video metadata, and statistics are regenerated consistently.
+
+```bash
+lerobot-edit-dataset \
+  --repo_id <INPUT_DATASET_REPO> \
+  --new_repo_id <TRIMMED_DATASET_REPO> \
+  --operation.type trim_stationary_episode_edges \
+  --operation.keep_start_seconds 1.0 \
+  --operation.keep_end_seconds 2.0 \
+  --operation.state_key observation.state \
+  --operation.state_epsilon 5e-4 \
+  --push_to_hub true
+```
+
+Use `trim_episode_edges` instead when you want a fixed-duration cut:
+
+```bash
+lerobot-edit-dataset \
+  --repo_id <INPUT_DATASET_REPO> \
+  --new_repo_id <TRIMMED_DATASET_REPO> \
+  --operation.type trim_episode_edges \
+  --operation.trim_start_seconds 2.0 \
+  --operation.trim_end_seconds 2.0 \
+  --push_to_hub true
+```
+
+## Pi0.5 TRTC Full Fine-Tuning
+
+TRTC requires overlap between predicted chunks and executed chunks:
+
+```text
+action_prefix_length <= chunk_size - n_action_steps
+```
+
+A conservative sanity run should be done first to verify config, processor loading, dataset stats, and weight loading:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=<TRIMMED_DATASET_REPO> \
+  --policy.type=pi05 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.repo_id=<HF_USER>/<MODEL_REPO> \
+  --policy.push_to_hub=false \
+  --output_dir=./outputs/pi05_trtc_fullft_sanity \
+  --job_name=pi05_trtc_fullft_sanity \
+  --policy.use_action_prefix_conditioning=true \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=40 \
+  --policy.action_prefix_length=10 \
+  --policy.dtype=bfloat16 \
+  --policy.gradient_checkpointing=true \
+  --policy.compile_model=false \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --batch_size=1 \
+  --steps=2 \
+  --save_freq=2 \
+  --eval_freq=0 \
+  --val_freq=0 \
+  --wandb.enable=false
+```
+
+Then run the real full fine-tune by increasing `steps` and `batch_size`. Keep `compile_model=false` until the non-compiled run is stable.
+
+```bash
+lerobot-train \
+  --dataset.repo_id=<TRIMMED_DATASET_REPO> \
+  --policy.type=pi05 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.repo_id=<HF_USER>/<MODEL_REPO> \
+  --policy.push_to_hub=true \
+  --output_dir=./outputs/pi05_trtc_fullft \
+  --job_name=pi05_trtc_fullft \
+  --policy.use_action_prefix_conditioning=true \
+  --policy.chunk_size=50 \
+  --policy.n_action_steps=40 \
+  --policy.action_prefix_length=10 \
+  --policy.dtype=bfloat16 \
+  --policy.gradient_checkpointing=true \
+  --policy.compile_model=false \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --batch_size=<GPU_MEMORY_FIT> \
+  --steps=<TRAIN_STEPS> \
+  --save_freq=5000 \
+  --eval_freq=0
+```
+
+Do not enable `policy.rtc_config.enabled` for this training path. That is inference-time RTC and is mutually exclusive with training-time action-prefix conditioning.
+
+## Async Inference for Pi0.5 TRTC
+
+Start the policy server:
+
+```bash
+python -m lerobot.async_inference.policy_server \
+  --host=127.0.0.1 \
+  --port=8080 \
+  --fps=<ROBOT_CONTROL_FPS>
+```
+
+Then start the robot client with a TRTC checkpoint:
+
+```bash
+python -m lerobot.async_inference.robot_client \
+  --server_address=127.0.0.1:8080 \
+  --robot.type=<ROBOT_TYPE> \
+  --robot.id=<ROBOT_ID> \
+  --task="<TASK>" \
+  --policy_type=pi05 \
+  --pretrained_name_or_path=./outputs/pi05_trtc_fullft/checkpoints/last/pretrained_model \
+  --policy_device=cuda \
+  --client_device=cpu \
+  --actions_per_chunk=50 \
+  --chunk_size_threshold=0.5 \
+  --aggregate_fn_name=latest_only
+```
+
+For TRTC checkpoints, `actions_per_chunk` must match the checkpoint `chunk_size`. `aggregate_fn_name=auto` is also valid; it resolves to `latest_only` when the checkpoint has `use_action_prefix_conditioning=true`.
 
 ## Robots & Control
 
@@ -69,7 +210,7 @@ To solve the data fragmentation problem in robotics, we utilize the **LeRobotDat
 
 - **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
 - **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
+- **Tools:** Delete episodes, trim fixed or stationary episode edges, split by indices/fractions, add/remove features, recompute stats, and merge multiple datasets.
 
 ```python
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -100,11 +241,13 @@ lerobot-train \
   --dataset.repo_id=lerobot/aloha_mobile_cabinet
 ```
 
-| Category                   | Models                                                                                                                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md)                                                             |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                  |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx) |
+| Category                   | Models                                                                                                                                                                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md) |
+| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                             |
+| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx)            |
+
+For this branch, see [Pi0.5](./docs/source/pi05.mdx) for TRTC training details and [Async Inference](./docs/source/async.mdx) for deployment constraints.
 
 Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
 
@@ -135,7 +278,7 @@ Learn how to implement your own simulation environment or benchmark and distribu
 
 ## Citation
 
-If you use LeRobot in your research, please cite:
+If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
 
 ```bibtex
 @misc{cadene2024lerobot,
@@ -146,9 +289,26 @@ If you use LeRobot in your research, please cite:
 }
 ```
 
+If you are referencing our research or the academic paper, please also cite our ICLR publication:
+
+<details>
+<summary><b>ICLR 2026 Paper</b></summary>
+
+```bibtex
+@inproceedings{cadenelerobot,
+  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
+  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
+  booktitle={The Fourteenth International Conference on Learning Representations},
+  year={2026},
+  url={https://arxiv.org/abs/2602.22818}
+}
+```
+
+</details>
+
 ## Contribute
 
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](./CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
+We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
 
 <p align="center">
   <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">

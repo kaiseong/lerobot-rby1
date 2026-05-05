@@ -232,7 +232,7 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
         fps=int(original_dataset.fps),
         root=new_dataset_root,
         robot_type=original_dataset.meta.robot_type,
-        features=deepcopy(original_dataset.meta.info["features"]),
+        features=deepcopy(original_dataset.meta.info.features),
         use_videos=len(original_dataset.meta.video_keys) > 0,
         vcodec=_resolve_crop_vcodec(original_dataset),
     )
@@ -243,8 +243,8 @@ def convert_lerobot_dataset_to_cropped_lerobot_dataset(
     )
 
     for key in crop_params_dict:
-        if key in new_dataset.meta.info["features"]:
-            new_dataset.meta.info["features"][key]["shape"] = [*resize_size, 3]
+        if key in new_dataset.meta.info.features:
+            new_dataset.meta.info.features[key]["shape"] = (*resize_size, 3)
 
     previous_episode_index = None
     for frame_idx in tqdm(range(len(original_dataset))):
@@ -304,7 +304,7 @@ def convert_lerobot_dataset_to_resized_padded_lerobot_dataset(
         fps=int(original_dataset.fps),
         root=new_dataset_root,
         robot_type=original_dataset.meta.robot_type,
-        features=deepcopy(original_dataset.meta.info["features"]),
+        features=deepcopy(original_dataset.meta.info.features),
         use_videos=len(original_dataset.meta.video_keys) > 0,
         vcodec=_resolve_crop_vcodec(original_dataset),
     )
@@ -315,8 +315,8 @@ def convert_lerobot_dataset_to_resized_padded_lerobot_dataset(
     )
 
     for key in original_dataset.meta.camera_keys:
-        if key in new_dataset.meta.info["features"]:
-            new_dataset.meta.info["features"][key]["shape"] = [*resize_size, 3]
+        if key in new_dataset.meta.info.features:
+            new_dataset.meta.info.features[key]["shape"] = (*resize_size, 3)
 
     previous_episode_index = None
     for frame_idx in tqdm(range(len(original_dataset))):

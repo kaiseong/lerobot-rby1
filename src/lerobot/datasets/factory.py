@@ -26,25 +26,23 @@ import numpy as np
 import pandas as pd
 import torch
 
-from lerobot.configs.default import DatasetConfig
-from lerobot.configs.policies import PreTrainedConfig
+from lerobot.configs import DatasetConfig, PreTrainedConfig
+from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.compute_stats import aggregate_stats
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.mixed_dataset import HeterogeneousLeRobotDataset, build_rby1_mixed_dataset
-from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-from lerobot.datasets.transforms import ImageTransforms
-from lerobot.datasets.utils import DEFAULT_EPISODES_PATH, load_info, unflatten_dict
 from lerobot.rl.crop_dataset_roi import (
     convert_lerobot_dataset_to_cropped_lerobot_dataset,
     convert_lerobot_dataset_to_resized_padded_lerobot_dataset,
 )
-from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_PREFIX, REWARD
+from lerobot.transforms import ImageTransforms
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, IMAGENET_STATS, OBS_PREFIX, REWARD
 
-IMAGENET_STATS = {
-    "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
-    "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
-}
+from .compute_stats import aggregate_stats
+from .dataset_metadata import LeRobotDatasetMetadata
+from .io_utils import load_info
+from .lerobot_dataset import LeRobotDataset
+from .streaming_dataset import StreamingLeRobotDataset
+from .utils import DEFAULT_EPISODES_PATH, unflatten_dict
 
 
 @dataclass(frozen=True)
@@ -55,12 +53,14 @@ class _ResolvedDatasetLocation:
 
 
 def resolve_delta_timestamps(
-    cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
+    cfg: PreTrainedConfig | RewardModelConfig, ds_meta: LeRobotDatasetMetadata
 ) -> dict[str, list] | None:
-    """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
+    """Resolves delta_timestamps by reading from the 'delta_indices' properties of the config.
 
     Args:
-        cfg (PreTrainedConfig): The PreTrainedConfig to read delta_indices from.
+        cfg (PreTrainedConfig | RewardModelConfig): The config to read delta_indices from. Both
+            ``PreTrainedConfig`` and concrete ``RewardModelConfig`` subclasses expose the
+            ``{observation,action,reward}_delta_indices`` properties used below.
         ds_meta (LeRobotDatasetMetadata): The dataset from which features and fps are used to build
             delta_timestamps against.
 
@@ -283,7 +283,7 @@ def _make_single_dataset(
         root=dataset_location.root,
         revision=dataset_location.revision,
     )
-    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
 
     if not cfg.dataset.streaming:
         return LeRobotDataset(
@@ -294,6 +294,7 @@ def _make_single_dataset(
             image_transforms=image_transforms,
             revision=dataset_location.revision,
             video_backend=cfg.dataset.video_backend,
+            return_uint8=True,
             tolerance_s=cfg.tolerance_s,
         )
 
@@ -306,6 +307,7 @@ def _make_single_dataset(
         revision=dataset_location.revision,
         max_num_shards=cfg.num_workers,
         tolerance_s=cfg.tolerance_s,
+        return_uint8=True,
     )
 
 
@@ -394,7 +396,7 @@ def make_train_val_datasets(
                 root=source_cfg.root,
                 revision=source_cfg.revision,
             )
-            delta_timestamps = resolve_delta_timestamps(cfg.policy, source_meta)
+            delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, source_meta)
             dataset = LeRobotDataset(
                 source_cfg.repo_id,
                 root=source_cfg.root,
@@ -403,6 +405,7 @@ def make_train_val_datasets(
                 image_transforms=train_image_transforms,
                 revision=source_cfg.revision,
                 video_backend=cfg.dataset.video_backend,
+                return_uint8=True,
                 tolerance_s=cfg.tolerance_s,
             )
             source_datasets.append((source_cfg, dataset, source_meta))
