@@ -3,6 +3,7 @@ import torch
 
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import (
+    PI05Policy,
     apply_action_prefix,
     build_action_timestep_schedule,
     build_prefix_step_mask,
@@ -160,3 +161,42 @@ def test_pi05_config_rejects_rtc_with_action_prefix_conditioning():
             action_prefix_length=4,
             rtc_config=RTCConfig(enabled=True),
         )
+
+
+def test_pi05_default_peft_targets_use_pi05_time_mlp_names():
+    policy = PI05Policy.__new__(PI05Policy)
+    target_modules = policy._get_default_peft_targets()["target_modules"]
+
+    assert "time_mlp_in" in target_modules
+    assert "time_mlp_out" in target_modules
+    assert "action_time_mlp" not in target_modules
+    assert "state_proj" not in target_modules
+
+
+def test_pi05_from_pretrained_raises_instead_of_returning_uninitialized_model(monkeypatch):
+    transformers_utils = pytest.importorskip("transformers.utils")
+    seen_kwargs = {}
+
+    def fake_init(self, config, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.config = config
+
+    def fake_cached_file(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        raise OSError("missing weights")
+
+    monkeypatch.setattr(PI05Policy, "__init__", fake_init)
+    monkeypatch.setattr(transformers_utils, "cached_file", fake_cached_file)
+
+    with pytest.raises(RuntimeError, match="Could not load PI05 weights"):
+        PI05Policy.from_pretrained(
+            "test/pi05",
+            config=PI05Config(),
+            local_files_only=True,
+            cache_dir="/tmp/pi05-cache",
+            revision="main",
+        )
+
+    assert seen_kwargs["local_files_only"] is True
+    assert seen_kwargs["cache_dir"] == "/tmp/pi05-cache"
+    assert seen_kwargs["revision"] == "main"

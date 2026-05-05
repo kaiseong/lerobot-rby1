@@ -424,7 +424,10 @@ def handle_trim_episode_edges(cfg: EditDatasetConfig) -> None:
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
     output_repo_id, output_dir = get_output_path(
-        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        cfg.repo_id,
+        cfg.new_repo_id,
+        Path(cfg.root) if cfg.root else None,
+        Path(cfg.new_root) if cfg.new_root else None,
     )
 
     if cfg.new_repo_id is None:
@@ -456,7 +459,10 @@ def handle_trim_stationary_episode_edges(cfg: EditDatasetConfig) -> None:
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
     output_repo_id, output_dir = get_output_path(
-        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        cfg.repo_id,
+        cfg.new_repo_id,
+        Path(cfg.root) if cfg.root else None,
+        Path(cfg.new_root) if cfg.new_root else None,
     )
 
     if cfg.new_repo_id is None:
