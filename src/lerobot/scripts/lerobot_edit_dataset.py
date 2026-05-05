@@ -261,6 +261,9 @@ class SplitConfig(OperationConfig):
 class TrimEpisodeEdgesConfig(OperationConfig):
     trim_start_seconds: float = 0.0
     trim_end_seconds: float = 0.0
+    visual_storage: str = "image"
+    image_writer_processes: int = 0
+    image_writer_threads: int | None = None
 
 
 @OperationConfig.register_subclass("trim_stationary_episode_edges")
@@ -270,6 +273,9 @@ class TrimStationaryEpisodeEdgesConfig(OperationConfig):
     keep_end_seconds: float = 0.0
     state_key: str = "observation.state"
     state_epsilon: float = 5e-4
+    visual_storage: str = "image"
+    image_writer_processes: int = 0
+    image_writer_threads: int | None = None
 
 
 @OperationConfig.register_subclass("merge")
@@ -443,6 +449,9 @@ def handle_trim_episode_edges(cfg: EditDatasetConfig) -> None:
         trim_end_seconds=cfg.operation.trim_end_seconds,
         output_dir=output_dir,
         repo_id=output_repo_id,
+        visual_storage=cfg.operation.visual_storage,
+        image_writer_processes=cfg.operation.image_writer_processes,
+        image_writer_threads=cfg.operation.image_writer_threads,
     )
 
     logging.info(f"Dataset saved to {output_dir}")
@@ -481,6 +490,9 @@ def handle_trim_stationary_episode_edges(cfg: EditDatasetConfig) -> None:
         repo_id=output_repo_id,
         state_key=cfg.operation.state_key,
         state_epsilon=cfg.operation.state_epsilon,
+        visual_storage=cfg.operation.visual_storage,
+        image_writer_processes=cfg.operation.image_writer_processes,
+        image_writer_threads=cfg.operation.image_writer_threads,
     )
 
     logging.info(f"Dataset saved to {output_dir}")

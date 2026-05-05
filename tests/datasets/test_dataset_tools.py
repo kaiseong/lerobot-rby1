@@ -28,6 +28,7 @@ from lerobot.datasets.dataset_tools import (
     add_features,
     delete_episodes,
     merge_datasets,
+    mirror_arm_dataset,
     modify_features,
     modify_tasks,
     recompute_exact_stats,
@@ -190,6 +191,263 @@ def _create_video_dataset_with_states(
     return dataset
 
 
+def _rby1_image(base: int) -> np.ndarray:
+    image = np.zeros((4, 6, 3), dtype=np.uint8)
+    for col in range(image.shape[1]):
+        image[:, col, :] = np.array([base + col, base + col + 1, base + col + 2], dtype=np.uint8)
+    return image
+
+
+def _image_tensor_to_uint8(image: torch.Tensor) -> np.ndarray:
+    if image.shape[0] in {1, 3, 4}:
+        image = image.permute(1, 2, 0)
+    array = image.detach().cpu().numpy()
+    if np.issubdtype(array.dtype, np.floating):
+        array = np.clip(np.rint(array * 255), 0, 255).astype(np.uint8)
+    return array
+
+
+def _create_rby1_right_image_dataset(tmp_path, empty_lerobot_dataset_factory):
+    action_names = ["torso_0", *[f"right_arm_{idx}" for idx in range(7)], "right_gripper_0"]
+    state_names = [
+        "torso_0",
+        *[f"right_arm_{idx}" for idx in range(7)],
+        "right_arm_1.vel",
+        "right_arm_2.torque",
+        "right_gripper_0",
+    ]
+    features = {
+        "action": {"dtype": "float32", "shape": (len(action_names),), "names": action_names},
+        "observation.state": {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
+        "observation.images.front": {"dtype": "image", "shape": (4, 6, 3), "names": None},
+        "observation.images.right": {"dtype": "image", "shape": (4, 6, 3), "names": None},
+        "observation.images.left": {"dtype": "image", "shape": (4, 6, 3), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "rby1_right_image_dataset",
+        features=features,
+        fps=10,
+        use_videos=False,
+    )
+
+    action = np.array([100, 0, 1, 2, 3, 4, 5, 6, 0.25], dtype=np.float32)
+    state = np.array([200, 10, 11, 12, 13, 14, 15, 16, 21, 22, 0.75], dtype=np.float32)
+    dataset.add_frame(
+        {
+            "action": action,
+            "observation.state": state,
+            "observation.images.front": _rby1_image(10),
+            "observation.images.right": _rby1_image(30),
+            "observation.images.left": _rby1_image(50),
+            "task": "pick object with the right arm",
+        }
+    )
+    dataset.save_episode()
+    dataset.finalize()
+
+    return dataset, action, state
+
+
+def _video_feature(height: int = 32, width: int = 32, fps: int = 10) -> dict:
+    return {
+        "dtype": "video",
+        "shape": (height, width, 3),
+        "names": None,
+        "info": {
+            "video.height": height,
+            "video.width": width,
+            "video.codec": "h264",
+            "video.pix_fmt": "yuv420p",
+            "video.is_depth_map": False,
+            "video.fps": fps,
+            "video.channels": 3,
+            "has_audio": False,
+        },
+    }
+
+
+def _create_rby1_right_video_dataset(tmp_path, empty_lerobot_dataset_factory):
+    action_names = ["torso_0", *[f"right_arm_{idx}" for idx in range(7)], "right_gripper_0"]
+    features = {
+        "action": {"dtype": "float32", "shape": (len(action_names),), "names": action_names},
+        "observation.state": {"dtype": "float32", "shape": (len(action_names),), "names": action_names},
+        "observation.images.front": _video_feature(),
+        "observation.images.right": _video_feature(),
+        "observation.images.left": _video_feature(),
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "rby1_right_video_dataset",
+        features=features,
+        fps=10,
+    )
+
+    for frame_idx in range(2):
+        values = np.array([100, 0, 1, 2, 3, 4, 5, 6, 0.25], dtype=np.float32) + frame_idx
+        dataset.add_frame(
+            {
+                "action": values,
+                "observation.state": values,
+                "observation.images.front": np.full((32, 32, 3), 10 + frame_idx, dtype=np.uint8),
+                "observation.images.right": np.full((32, 32, 3), 30 + frame_idx, dtype=np.uint8),
+                "observation.images.left": np.full((32, 32, 3), 50 + frame_idx, dtype=np.uint8),
+                "task": "right arm video task",
+            }
+        )
+    dataset.save_episode(parallel_encoding=False)
+    dataset.finalize()
+
+    return dataset
+
+
+def _create_rby1_bimanual_image_dataset(tmp_path, empty_lerobot_dataset_factory):
+    names = [
+        "torso_0",
+        *[f"right_arm_{idx}" for idx in range(7)],
+        "right_gripper_0",
+        *[f"left_arm_{idx}" for idx in range(7)],
+        "left_gripper_0",
+    ]
+    features = {
+        "action": {"dtype": "float32", "shape": (len(names),), "names": names},
+        "observation.state": {"dtype": "float32", "shape": (len(names),), "names": names},
+        "observation.images.front": {"dtype": "image", "shape": (4, 6, 3), "names": None},
+        "observation.images.right": {"dtype": "image", "shape": (4, 6, 3), "names": None},
+        "observation.images.left": {"dtype": "image", "shape": (4, 6, 3), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "rby1_bimanual_image_dataset",
+        features=features,
+        fps=10,
+        use_videos=False,
+    )
+
+    values = np.array([100, 0, 1, 2, 3, 4, 5, 6, 0.25, 10, 11, 12, 13, 14, 15, 16, 0.75], dtype=np.float32)
+    dataset.add_frame(
+        {
+            "action": values,
+            "observation.state": values,
+            "observation.images.front": _rby1_image(70),
+            "observation.images.right": _rby1_image(90),
+            "observation.images.left": _rby1_image(110),
+            "task": "bimanual task",
+        }
+    )
+    dataset.save_episode()
+    dataset.finalize()
+
+    return dataset, values
+
+
+def test_mirror_arm_dataset_right_to_left_image_dataset(tmp_path, empty_lerobot_dataset_factory):
+    dataset, action, state = _create_rby1_right_image_dataset(tmp_path, empty_lerobot_dataset_factory)
+
+    mirrored = mirror_arm_dataset(
+        dataset,
+        output_dir=tmp_path / "rby1_right_to_left",
+        repo_id="test/rby1_right_to_left",
+        mirror_mode="right_to_left",
+    )
+
+    assert mirrored.meta.features["action"]["names"] == [
+        "torso_0",
+        *[f"left_arm_{idx}" for idx in range(7)],
+        "left_gripper_0",
+    ]
+    assert mirrored.meta.features["observation.state"]["names"] == [
+        "torso_0",
+        *[f"left_arm_{idx}" for idx in range(7)],
+        "left_arm_1.vel",
+        "left_arm_2.torque",
+        "left_gripper_0",
+    ]
+
+    item = mirrored[0]
+    np.testing.assert_allclose(
+        item["action"].numpy(),
+        np.array([100, 0, -1, -2, 3, -4, 5, 6, 0.25], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        item["observation.state"].numpy(),
+        np.array([200, 10, -11, -12, 13, -14, 15, 16, -21, -22, 0.75], dtype=np.float32),
+    )
+
+    np.testing.assert_allclose(
+        _image_tensor_to_uint8(item["observation.images.front"]),
+        np.flip(_rby1_image(10), axis=1),
+        atol=1,
+    )
+    np.testing.assert_allclose(
+        _image_tensor_to_uint8(item["observation.images.left"]),
+        np.flip(_rby1_image(30), axis=1),
+        atol=1,
+    )
+    np.testing.assert_allclose(
+        _image_tensor_to_uint8(item["observation.images.right"]),
+        np.flip(_rby1_image(50), axis=1),
+        atol=1,
+    )
+    assert mirrored.meta.total_episodes == dataset.meta.total_episodes
+    assert mirrored.meta.total_frames == dataset.meta.total_frames
+    assert mirrored[0]["task"] == "pick object with the right arm"
+
+
+def test_mirror_arm_dataset_both_can_include_original(tmp_path, empty_lerobot_dataset_factory):
+    dataset, values = _create_rby1_bimanual_image_dataset(tmp_path, empty_lerobot_dataset_factory)
+
+    mirrored = mirror_arm_dataset(
+        dataset,
+        output_dir=tmp_path / "rby1_both",
+        repo_id="test/rby1_both",
+        mirror_mode="both",
+        include_original=True,
+    )
+
+    assert mirrored.meta.total_episodes == 2
+    assert mirrored.meta.total_frames == 2
+    np.testing.assert_allclose(mirrored[0]["action"].numpy(), values)
+    np.testing.assert_allclose(
+        mirrored[1]["action"].numpy(),
+        np.array(
+            [100, 10, -11, -12, 13, -14, 15, 16, 0.75, 0, -1, -2, 3, -4, 5, 6, 0.25],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_mirror_arm_dataset_both_requires_counterpart(tmp_path, empty_lerobot_dataset_factory):
+    dataset, _, _ = _create_rby1_right_image_dataset(tmp_path, empty_lerobot_dataset_factory)
+
+    with pytest.raises(ValueError, match="both mirroring requires counterpart"):
+        mirror_arm_dataset(
+            dataset,
+            output_dir=tmp_path / "invalid_both",
+            repo_id="test/invalid_both",
+            mirror_mode="both",
+        )
+
+
+def test_mirror_arm_dataset_video_smoke(tmp_path, empty_lerobot_dataset_factory):
+    dataset = _create_rby1_right_video_dataset(tmp_path, empty_lerobot_dataset_factory)
+
+    mirrored = mirror_arm_dataset(
+        dataset,
+        output_dir=tmp_path / "rby1_video_mirrored",
+        repo_id="test/rby1_video_mirrored",
+        mirror_mode="right_to_left",
+    )
+
+    assert mirrored.meta.total_episodes == 1
+    assert mirrored.meta.total_frames == 2
+    assert mirrored.meta.video_keys == []
+    assert mirrored.meta.image_keys == dataset.meta.video_keys
+    np.testing.assert_allclose(
+        mirrored[0]["action"].numpy(),
+        np.array([100, 0, -1, -2, 3, -4, 5, 6, 0.25], dtype=np.float32),
+    )
+    for image_key in mirrored.meta.image_keys:
+        assert image_key in mirrored[0]
+
+
 def test_trim_episode_edges(sample_video_dataset, tmp_path):
     output_dir = tmp_path / "trimmed_video_dataset"
     trim_seconds = 1 / sample_video_dataset.meta.fps
@@ -210,6 +468,8 @@ def test_trim_episode_edges(sample_video_dataset, tmp_path):
     assert trimmed_dataset.meta.stats is not None
     for video_key in sample_video_dataset.meta.video_keys:
         assert video_key in trimmed_dataset.meta.stats
+    assert trimmed_dataset.meta.video_keys == []
+    assert trimmed_dataset.meta.image_keys == sample_video_dataset.meta.video_keys
 
     if trimmed_dataset.meta.episodes is None:
         trimmed_dataset.meta.episodes = load_episodes(trimmed_dataset.meta.root)
@@ -220,9 +480,6 @@ def test_trim_episode_edges(sample_video_dataset, tmp_path):
     for ep_idx in range(trimmed_dataset.meta.total_episodes):
         ep_meta = trimmed_dataset.meta.episodes[ep_idx]
         assert ep_meta["length"] == expected_length
-        for video_key in trimmed_dataset.meta.video_keys:
-            video_path = trimmed_dataset.root / trimmed_dataset.meta.get_video_file_path(ep_idx, video_key)
-            assert video_path.exists()
 
     first_episode_indices = [
         idx
@@ -238,8 +495,8 @@ def test_trim_episode_edges(sample_video_dataset, tmp_path):
 
     item = trimmed_dataset[0]
     assert "action" in item
-    for video_key in trimmed_dataset.meta.video_keys:
-        assert video_key in item
+    for image_key in trimmed_dataset.meta.image_keys:
+        assert image_key in item
 
 
 def test_trim_episode_edges_rejects_invalid_requests(sample_video_dataset, tmp_path):

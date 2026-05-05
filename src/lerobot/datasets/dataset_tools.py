@@ -20,12 +20,16 @@ This module provides utilities for:
 - Deleting episodes from datasets
 - Trimming fixed-duration windows from episode boundaries
 - Trimming stationary windows from episode boundaries based on robot state
+- Mirroring left/right arm datasets for symmetric robot data augmentation
 - Splitting datasets into multiple smaller datasets
 - Adding/removing features from datasets
 - Merging datasets (wrapper around aggregate functionality)
 """
 
+import copy
 import logging
+import os
+import re
 import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,7 +42,7 @@ import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
-from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, HF_LEROBOT_HOME, OBS_IMAGE, OBS_STATE
+from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, HF_LEROBOT_HOME, OBS_IMAGE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.utils import flatten_dict
 
 from .aggregate import aggregate_datasets
@@ -65,6 +69,12 @@ from .utils import (
     update_chunk_file_indices,
 )
 from .video_utils import decode_video_frames, encode_video_frames, get_video_info, resolve_vcodec
+
+
+_ARM_NAME_RE = re.compile(r"^(right|left)_arm_(\d+)(.*)$")
+_GRIPPER_NAME_RE = re.compile(r"^(right|left)_gripper_(\d+)(.*)$")
+_MIRROR_MODES = {"right_to_left", "left_to_right", "both"}
+_VISUAL_STORAGE_MODES = {"image", "video"}
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -198,19 +208,66 @@ def _get_dataset_video_backend(dataset: LeRobotDataset) -> str | None:
     return getattr(dataset, "video_backend", getattr(dataset, "_video_backend", None))
 
 
+def _validate_visual_storage(visual_storage: str) -> None:
+    if visual_storage not in _VISUAL_STORAGE_MODES:
+        raise ValueError(
+            f"visual_storage must be one of {sorted(_VISUAL_STORAGE_MODES)}, got '{visual_storage}'"
+        )
+
+
+def _validate_image_writer_config(image_writer_processes: int, image_writer_threads: int) -> None:
+    if image_writer_processes < 0 or image_writer_threads < 0:
+        raise ValueError("image_writer_processes and image_writer_threads must be non-negative")
+    if image_writer_processes > 0 and image_writer_threads == 0:
+        raise ValueError("image_writer_threads must be greater than 0 when image_writer_processes > 0")
+
+
+def _default_image_writer_threads() -> int:
+    return max(4, min(16, os.cpu_count() or 4))
+
+
+def _build_visual_storage_features(
+    features: dict,
+    camera_keys: list[str],
+    visual_storage: str,
+) -> dict:
+    output_features = copy.deepcopy(features)
+    output_dtype = "video" if visual_storage == "video" else "image"
+
+    for key in camera_keys:
+        output_features[key]["dtype"] = output_dtype
+        if output_dtype == "image":
+            output_features[key].pop("info", None)
+
+    return output_features
+
+
 def _create_trimmed_dataset(
     dataset: LeRobotDataset,
     output_dir: Path,
     repo_id: str,
+    visual_storage: str,
+    image_writer_processes: int,
+    image_writer_threads: int,
 ) -> LeRobotDataset:
+    _validate_visual_storage(visual_storage)
+    _validate_image_writer_config(image_writer_processes, image_writer_threads)
+    output_features = _build_visual_storage_features(
+        dataset.meta.features,
+        list(dataset.meta.video_keys),
+        visual_storage,
+    )
+
     trimmed_dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=dataset.meta.fps,
-        features=dataset.meta.features,
+        features=output_features,
         root=output_dir,
         robot_type=dataset.meta.robot_type,
-        use_videos=True,
+        use_videos=visual_storage == "video",
         tolerance_s=dataset.tolerance_s,
+        image_writer_processes=image_writer_processes,
+        image_writer_threads=image_writer_threads,
         video_backend=_get_dataset_video_backend(dataset),
         vcodec=_resolve_trim_vcodec(dataset),
     )
@@ -227,8 +284,18 @@ def _rebuild_trimmed_dataset(
     episode_ranges: dict[int, tuple[int, int]],
     output_dir: Path,
     repo_id: str,
+    visual_storage: str,
+    image_writer_processes: int,
+    image_writer_threads: int,
 ) -> LeRobotDataset:
-    trimmed_dataset = _create_trimmed_dataset(dataset, output_dir, repo_id)
+    trimmed_dataset = _create_trimmed_dataset(
+        dataset,
+        output_dir,
+        repo_id,
+        visual_storage,
+        image_writer_processes,
+        image_writer_threads,
+    )
 
     feature_keys_to_copy = [
         key
@@ -263,6 +330,7 @@ def _rebuild_trimmed_dataset(
                 query_timestamps,
                 dataset.tolerance_s,
                 _get_dataset_video_backend(dataset),
+                return_uint8=True,
             )
 
         per_feature_values = {key: kept_df[key].tolist() for key in feature_keys_to_copy}
@@ -315,6 +383,9 @@ def trim_episode_edges(
     trim_end_seconds: float,
     output_dir: str | Path | None = None,
     repo_id: str | None = None,
+    visual_storage: str = "image",
+    image_writer_processes: int = 0,
+    image_writer_threads: int | None = None,
 ) -> LeRobotDataset:
     """Trim a fixed duration from the start and end of each episode in a video dataset.
 
@@ -322,6 +393,10 @@ def trim_episode_edges(
     metadata, and statistics are all regenerated consistently.
     """
     _validate_video_trim_dataset(dataset, "trim_episode_edges")
+    _validate_visual_storage(visual_storage)
+    if image_writer_threads is None:
+        image_writer_threads = _default_image_writer_threads()
+    _validate_image_writer_config(image_writer_processes, image_writer_threads)
 
     if trim_start_seconds < 0 or trim_end_seconds < 0:
         raise ValueError("trim_start_seconds and trim_end_seconds must be non-negative")
@@ -350,7 +425,15 @@ def trim_episode_edges(
         ep_idx: (trim_start_frames, int(ep["length"]) - trim_end_frames)
         for ep_idx, ep in enumerate(dataset.meta.episodes)
     }
-    return _rebuild_trimmed_dataset(dataset, episode_ranges, output_dir, repo_id)
+    return _rebuild_trimmed_dataset(
+        dataset,
+        episode_ranges,
+        output_dir,
+        repo_id,
+        visual_storage,
+        image_writer_processes,
+        image_writer_threads,
+    )
 
 
 def trim_stationary_episode_edges(
@@ -361,9 +444,16 @@ def trim_stationary_episode_edges(
     repo_id: str | None = None,
     state_key: str = "observation.state",
     state_epsilon: float = 5e-4,
+    visual_storage: str = "image",
+    image_writer_processes: int = 0,
+    image_writer_threads: int | None = None,
 ) -> LeRobotDataset:
     """Trim stationary episode boundaries while preserving a motion-adjacent slice on each side."""
     _validate_video_trim_dataset(dataset, "trim_stationary_episode_edges")
+    _validate_visual_storage(visual_storage)
+    if image_writer_threads is None:
+        image_writer_threads = _default_image_writer_threads()
+    _validate_image_writer_config(image_writer_processes, image_writer_threads)
 
     if keep_start_seconds < 0 or keep_end_seconds < 0:
         raise ValueError("keep_start_seconds and keep_end_seconds must be non-negative")
@@ -372,7 +462,8 @@ def trim_stationary_episode_edges(
     if state_key not in dataset.meta.features:
         raise ValueError(f"State feature '{state_key}' not found in dataset features")
     if dataset.meta.features[state_key].get("dtype") in {"image", "video"}:
-        raise ValueError(f"State feature '{state_key}' must be numeric, not {dataset.meta.features[state_key]['dtype']}")
+        dtype = dataset.meta.features[state_key]["dtype"]
+        raise ValueError(f"State feature '{state_key}' must be numeric, not {dtype}")
 
     keep_start_frames = round(keep_start_seconds * dataset.meta.fps)
     keep_end_frames = round(keep_end_seconds * dataset.meta.fps)
@@ -417,7 +508,453 @@ def trim_stationary_episode_edges(
             f"{invalid_episodes}"
         )
 
-    return _rebuild_trimmed_dataset(dataset, episode_ranges, output_dir, repo_id)
+    return _rebuild_trimmed_dataset(
+        dataset,
+        episode_ranges,
+        output_dir,
+        repo_id,
+        visual_storage,
+        image_writer_processes,
+        image_writer_threads,
+    )
+
+
+def _swap_side(side: str) -> str:
+    return "left" if side == "right" else "right"
+
+
+def _parse_sided_name(name: str) -> tuple[str, str, int, str] | None:
+    arm_match = _ARM_NAME_RE.match(name)
+    if arm_match:
+        side, idx, suffix = arm_match.groups()
+        return "arm", side, int(idx), suffix
+
+    gripper_match = _GRIPPER_NAME_RE.match(name)
+    if gripper_match:
+        side, idx, suffix = gripper_match.groups()
+        return "gripper", side, int(idx), suffix
+
+    return None
+
+
+def _should_mirror_source_side(side: str, mirror_mode: str) -> bool:
+    return (
+        mirror_mode == "both"
+        or (mirror_mode == "right_to_left" and side == "right")
+        or (mirror_mode == "left_to_right" and side == "left")
+    )
+
+
+def _mirrored_feature_name(name: str, mirror_mode: str) -> str:
+    parsed = _parse_sided_name(name)
+    if parsed is None:
+        return name
+
+    kind, side, idx, suffix = parsed
+    if not _should_mirror_source_side(side, mirror_mode):
+        return name
+
+    return f"{_swap_side(side)}_{kind}_{idx}{suffix}"
+
+
+def _validate_vector_feature_for_mirroring(features: dict, key: str) -> list[str]:
+    if key not in features:
+        raise ValueError(f"Feature '{key}' not found in dataset features")
+
+    feature = features[key]
+    if feature.get("dtype") in {"image", "video"}:
+        raise ValueError(f"Feature '{key}' must be a numeric vector, not {feature['dtype']}")
+
+    shape = feature.get("shape")
+    names = feature.get("names")
+    if not isinstance(shape, (tuple, list)) or len(shape) != 1:
+        raise ValueError(f"Feature '{key}' must be a 1D vector feature")
+    if not isinstance(names, list) or len(names) != int(shape[0]):
+        raise ValueError(f"Feature '{key}' must define one name per vector dimension")
+
+    return list(names)
+
+
+def _validate_mirror_mode_names(
+    source_names_by_key: dict[str, list[str]],
+    mirror_mode: str,
+) -> None:
+    all_names = [name for names in source_names_by_key.values() for name in names]
+
+    if mirror_mode == "right_to_left":
+        if not any((parsed := _parse_sided_name(name)) is not None and parsed[1] == "right" for name in all_names):
+            raise ValueError("right_to_left mirroring requires at least one right-side arm or gripper name")
+    elif mirror_mode == "left_to_right":
+        if not any((parsed := _parse_sided_name(name)) is not None and parsed[1] == "left" for name in all_names):
+            raise ValueError("left_to_right mirroring requires at least one left-side arm or gripper name")
+    elif mirror_mode == "both":
+        for key, source_names in source_names_by_key.items():
+            source_name_set = set(source_names)
+            for name in source_names:
+                parsed = _parse_sided_name(name)
+                if parsed is None:
+                    continue
+                counterpart = _mirrored_feature_name(name, mirror_mode)
+                if counterpart not in source_name_set:
+                    raise ValueError(
+                        f"both mirroring requires counterpart '{counterpart}' for '{name}' in feature '{key}'"
+                    )
+
+
+def _build_mirrored_features(
+    features: dict,
+    vector_keys: list[str],
+    mirror_mode: str,
+) -> tuple[dict, dict[str, list[str]]]:
+    mirrored_features = copy.deepcopy(features)
+    source_names_by_key = {
+        key: _validate_vector_feature_for_mirroring(features, key)
+        for key in vector_keys
+        if key is not None
+    }
+
+    _validate_mirror_mode_names(source_names_by_key, mirror_mode)
+
+    for key, source_names in source_names_by_key.items():
+        output_names = (
+            list(source_names)
+            if mirror_mode == "both"
+            else [_mirrored_feature_name(name, mirror_mode) for name in source_names]
+        )
+        if len(set(output_names)) != len(output_names):
+            raise ValueError(
+                f"Mirroring feature '{key}' with mode '{mirror_mode}' would produce duplicate names: "
+                f"{output_names}"
+            )
+
+        mirrored_features[key]["names"] = output_names
+        mirrored_features[key]["shape"] = (len(output_names),)
+
+    return mirrored_features, source_names_by_key
+
+
+def _build_vector_mirror_plan(
+    source_names: list[str],
+    output_names: list[str],
+    mirror_mode: str,
+    sign_flip_indices: set[int],
+) -> list[tuple[int, int, float]]:
+    output_index_by_name = {name: idx for idx, name in enumerate(output_names)}
+    plan = []
+
+    for source_idx, source_name in enumerate(source_names):
+        output_name = _mirrored_feature_name(source_name, mirror_mode)
+        if output_name not in output_index_by_name:
+            raise ValueError(f"Mirrored output name '{output_name}' is missing from output feature names")
+
+        sign = 1.0
+        parsed = _parse_sided_name(source_name)
+        if parsed is not None:
+            kind, side, joint_idx, _ = parsed
+            if kind == "arm" and joint_idx in sign_flip_indices and _should_mirror_source_side(side, mirror_mode):
+                sign = -1.0
+
+        plan.append((source_idx, output_index_by_name[output_name], sign))
+
+    return plan
+
+
+def _mirror_vector_values(
+    values: list,
+    plan: list[tuple[int, int, float]],
+    output_dim: int,
+) -> list[np.ndarray]:
+    source = np.stack([np.asarray(value, dtype=np.float32).reshape(-1) for value in values])
+    if source.shape[1] != len(plan):
+        raise ValueError(f"Vector values have {source.shape[1]} dimensions, expected {len(plan)}")
+
+    output = np.empty((source.shape[0], output_dim), dtype=np.float32)
+    for source_idx, output_idx, sign in plan:
+        output[:, output_idx] = source[:, source_idx] * sign
+
+    return [row for row in output]
+
+
+def _image_to_hwc(image):
+    if isinstance(image, torch.Tensor):
+        if image.ndim == 3 and image.shape[0] in {1, 3, 4} and image.shape[-1] not in {1, 3, 4}:
+            return image.permute(1, 2, 0)
+        return image
+
+    if isinstance(image, np.ndarray):
+        if image.ndim == 3 and image.shape[0] in {1, 3, 4} and image.shape[-1] not in {1, 3, 4}:
+            return np.moveaxis(image, 0, -1)
+        return image
+
+    return np.asarray(image)
+
+
+def _horizontal_flip_hwc(image):
+    image = _image_to_hwc(image)
+    if isinstance(image, torch.Tensor):
+        return torch.flip(image, dims=[1])
+    return np.flip(image, axis=1).copy()
+
+
+def _validate_mirror_camera_features(
+    dataset: LeRobotDataset,
+    front_camera_key: str | None,
+    right_camera_key: str | None,
+    left_camera_key: str | None,
+) -> None:
+    if dataset.meta.episodes is None:
+        dataset.meta.episodes = load_episodes(dataset.meta.root)
+    if dataset.meta.tasks is None:
+        raise ValueError("Dataset tasks metadata is required for mirror_arm_dataset")
+
+    camera_keys = list(dataset.meta.camera_keys)
+    if not camera_keys:
+        raise ValueError("mirror_arm_dataset requires at least one image or video camera feature")
+
+    camera_dtypes = {dataset.meta.features[key]["dtype"] for key in camera_keys}
+    if not camera_dtypes.issubset({"image", "video"}):
+        raise ValueError(f"Camera features must be image or video features, got {camera_dtypes}")
+    if len(camera_dtypes) > 1:
+        raise ValueError("mirror_arm_dataset does not support mixed image and video camera features")
+
+    configured_keys = [key for key in [front_camera_key, right_camera_key, left_camera_key] if key]
+    missing = [key for key in configured_keys if key not in dataset.meta.features]
+    if missing:
+        raise ValueError(f"Configured camera keys are missing from dataset features: {missing}")
+
+    for key in configured_keys:
+        if dataset.meta.features[key]["dtype"] not in {"image", "video"}:
+            raise ValueError(f"Configured camera key '{key}' must be an image or video feature")
+
+    if bool(right_camera_key) != bool(left_camera_key):
+        raise ValueError("right_camera_key and left_camera_key must be configured together")
+
+    if right_camera_key and left_camera_key:
+        right_shape = tuple(dataset.meta.features[right_camera_key]["shape"])
+        left_shape = tuple(dataset.meta.features[left_camera_key]["shape"])
+        if right_shape != left_shape:
+            raise ValueError(
+                f"Right/left camera shapes must match for swapping: {right_shape} vs {left_shape}"
+            )
+
+
+def _get_mirror_camera_source(
+    camera_key: str,
+    front_camera_key: str | None,
+    right_camera_key: str | None,
+    left_camera_key: str | None,
+) -> tuple[str, bool]:
+    if front_camera_key and camera_key == front_camera_key:
+        return front_camera_key, True
+    if left_camera_key and right_camera_key and camera_key == left_camera_key:
+        return right_camera_key, True
+    if right_camera_key and left_camera_key and camera_key == right_camera_key:
+        return left_camera_key, True
+    return camera_key, False
+
+
+def _load_episode_visual_frames(
+    dataset: LeRobotDataset,
+    ep_idx: int,
+    ep_meta: dict,
+    ep_df: pd.DataFrame,
+    image_hf_dataset: datasets.Dataset | None,
+) -> dict[str, list]:
+    visual_frames: dict[str, list] = {}
+
+    if dataset.meta.video_keys:
+        kept_timestamps = [float(ts) for ts in ep_df["timestamp"].tolist()]
+        for video_key in dataset.meta.video_keys:
+            source_video_path = dataset.root / dataset.meta.get_video_file_path(ep_idx, video_key)
+            from_timestamp = float(ep_meta[f"videos/{video_key}/from_timestamp"])
+            query_timestamps = [from_timestamp + ts for ts in kept_timestamps]
+            decoded = decode_video_frames(
+                source_video_path,
+                query_timestamps,
+                dataset.tolerance_s,
+                _get_dataset_video_backend(dataset),
+                return_uint8=True,
+            )
+            visual_frames[video_key] = [decoded[i] for i in range(decoded.shape[0])]
+
+    if dataset.meta.image_keys:
+        if image_hf_dataset is None:
+            raise ValueError("Image-backed dataset frames could not be loaded")
+        from_idx = int(ep_meta["dataset_from_index"])
+        to_idx = int(ep_meta["dataset_to_index"])
+        episode_images = image_hf_dataset.select(range(from_idx, to_idx))
+        for image_key in dataset.meta.image_keys:
+            visual_frames[image_key] = [episode_images[i][image_key] for i in range(len(ep_df))]
+
+    return visual_frames
+
+
+def mirror_arm_dataset(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    mirror_mode: str = "right_to_left",
+    include_original: bool = False,
+    state_key: str = OBS_STATE,
+    action_key: str = ACTION,
+    front_camera_key: str | None = f"{OBS_IMAGES}.front",
+    right_camera_key: str | None = f"{OBS_IMAGES}.right",
+    left_camera_key: str | None = f"{OBS_IMAGES}.left",
+    sign_flip_indices: list[int] | None = None,
+    visual_storage: str = "image",
+    image_writer_processes: int = 0,
+    image_writer_threads: int | None = None,
+) -> LeRobotDataset:
+    """Create a mirrored arm dataset for left/right symmetric robot data augmentation.
+
+    The transformation is driven by vector dimension names in ``action_key`` and
+    ``state_key``. RBY1-style arm dimensions named ``right_arm_i`` or ``left_arm_i``
+    are swapped according to ``mirror_mode``; arm indices in ``sign_flip_indices``
+    have their signs inverted. Gripper dimensions are swapped without sign changes.
+    Configured cameras are horizontally flipped, with right/left camera streams
+    swapped before writing the output dataset.
+    """
+    if mirror_mode not in _MIRROR_MODES:
+        raise ValueError(
+            f"mirror_mode must be one of {sorted(_MIRROR_MODES)}, got '{mirror_mode}'"
+        )
+    _validate_visual_storage(visual_storage)
+    if image_writer_threads is None:
+        image_writer_threads = _default_image_writer_threads()
+    _validate_image_writer_config(image_writer_processes, image_writer_threads)
+    if include_original and mirror_mode != "both":
+        raise ValueError(
+            "include_original is only supported with mirror_mode='both' because schema must match"
+        )
+
+    if sign_flip_indices is None:
+        sign_flip_indices = [1, 2, 4]
+    sign_flip_set = set(sign_flip_indices)
+    if any(idx < 0 for idx in sign_flip_set):
+        raise ValueError("sign_flip_indices must be non-negative")
+
+    _validate_mirror_camera_features(dataset, front_camera_key, right_camera_key, left_camera_key)
+
+    vector_keys = [key for key in [action_key, state_key] if key]
+    mirrored_features, source_names_by_key = _build_mirrored_features(
+        dataset.meta.features, vector_keys, mirror_mode
+    )
+    mirrored_features = _build_visual_storage_features(
+        mirrored_features,
+        list(dataset.meta.camera_keys),
+        visual_storage,
+    )
+
+    vector_plans = {
+        key: _build_vector_mirror_plan(
+            source_names=source_names,
+            output_names=mirrored_features[key]["names"],
+            mirror_mode=mirror_mode,
+            sign_flip_indices=sign_flip_set,
+        )
+        for key, source_names in source_names_by_key.items()
+    }
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_mirrored"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+    output_dir = output_dir.resolve()
+    if output_dir == dataset.root.resolve():
+        raise ValueError(
+            "output_dir must point to a different directory; mirror augmentation never edits in place"
+        )
+
+    mirrored_dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=mirrored_features,
+        root=output_dir,
+        robot_type=dataset.meta.robot_type,
+        use_videos=visual_storage == "video",
+        tolerance_s=dataset.tolerance_s,
+        image_writer_processes=image_writer_processes,
+        image_writer_threads=image_writer_threads,
+        video_backend=_get_dataset_video_backend(dataset),
+        vcodec=_resolve_trim_vcodec(dataset) if visual_storage == "video" else "libsvtav1",
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+    )
+    mirrored_dataset.meta.update_chunk_settings(
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    feature_keys_to_copy = [
+        key
+        for key in dataset.meta.features
+        if key not in DEFAULT_FEATURES and key not in dataset.meta.camera_keys
+    ]
+    task_lookup = {int(row.task_index): task for task, row in dataset.meta.tasks.iterrows()}
+    image_hf_dataset = dataset.hf_dataset.with_format(None) if dataset.meta.image_keys else None
+
+    cached_data_path = None
+    cached_df: pd.DataFrame | None = None
+
+    for ep_idx in tqdm(range(dataset.meta.total_episodes), desc="Mirroring episodes"):
+        ep_meta = dataset.meta.episodes[ep_idx]
+        data_path = dataset.root / dataset.meta.get_data_file_path(ep_idx)
+        if data_path != cached_data_path:
+            cached_df = pd.read_parquet(data_path)
+            cached_data_path = data_path
+
+        assert cached_df is not None
+        ep_df = cached_df[cached_df["episode_index"] == ep_idx].reset_index(drop=True)
+        visual_frames = _load_episode_visual_frames(dataset, ep_idx, ep_meta, ep_df, image_hf_dataset)
+        per_feature_values = {key: ep_df[key].tolist() for key in feature_keys_to_copy}
+        mirrored_feature_values = {
+            key: _mirror_vector_values(
+                per_feature_values[key],
+                vector_plans[key],
+                int(mirrored_features[key]["shape"][0]),
+            )
+            for key in vector_plans
+        }
+        task_indices = ep_df["task_index"].tolist()
+
+        variants = ["mirror"]
+        if include_original:
+            variants.insert(0, "original")
+
+        for variant in variants:
+            for frame_idx in range(len(ep_df)):
+                frame = {"task": task_lookup[int(task_indices[frame_idx])]}
+
+                for key in feature_keys_to_copy:
+                    value = per_feature_values[key][frame_idx]
+                    if variant == "mirror" and key in vector_plans:
+                        value = mirrored_feature_values[key][frame_idx]
+                    frame[key] = value
+
+                for camera_key in dataset.meta.camera_keys:
+                    source_key, should_flip = _get_mirror_camera_source(
+                        camera_key, front_camera_key, right_camera_key, left_camera_key
+                    )
+                    image = _image_to_hwc(visual_frames[source_key][frame_idx])
+                    if variant == "mirror" and should_flip:
+                        image = _horizontal_flip_hwc(image)
+                    frame[camera_key] = image
+
+                mirrored_dataset.add_frame(frame)
+
+            mirrored_dataset.save_episode(parallel_encoding=visual_storage == "video")
+
+    mirrored_dataset.finalize()
+
+    return LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+        video_backend=_get_dataset_video_backend(dataset),
+    )
+
 
 def split_dataset(
     dataset: LeRobotDataset,

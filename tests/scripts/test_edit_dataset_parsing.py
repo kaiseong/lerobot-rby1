@@ -105,12 +105,20 @@ class TestOperationTypeParsing:
     "operation, handler_name, tool_name",
     [
         (
-            TrimEpisodeEdgesConfig(trim_start_seconds=1.0, trim_end_seconds=0.5),
+            TrimEpisodeEdgesConfig(
+                trim_start_seconds=1.0,
+                trim_end_seconds=0.5,
+                image_writer_threads=8,
+            ),
             "handle_trim_episode_edges",
             "trim_episode_edges",
         ),
         (
-            TrimStationaryEpisodeEdgesConfig(keep_start_seconds=1.0, keep_end_seconds=0.5),
+            TrimStationaryEpisodeEdgesConfig(
+                keep_start_seconds=1.0,
+                keep_end_seconds=0.5,
+                image_writer_threads=8,
+            ),
             "handle_trim_stationary_episode_edges",
             "trim_stationary_episode_edges",
         ),
@@ -159,3 +167,6 @@ def test_trim_handlers_pass_new_root_to_get_output_path(
     }
     assert captured_trim_kwargs["repo_id"] == "test/output"
     assert captured_trim_kwargs["output_dir"] == tmp_path / "output"
+    assert captured_trim_kwargs["visual_storage"] == "image"
+    assert captured_trim_kwargs["image_writer_threads"] == 8
+    assert captured_trim_kwargs["image_writer_processes"] == 0
