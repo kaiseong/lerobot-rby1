@@ -42,12 +42,36 @@ def resolve_workers(value: str | int | None, total_items: int | None = None) -> 
     return workers
 
 
+def default_lerobot_home() -> Path:
+    if "HF_LEROBOT_HOME" in os.environ:
+        return Path(os.environ["HF_LEROBOT_HOME"]).expanduser()
+    try:
+        from huggingface_hub.constants import HF_HOME
+    except Exception:
+        HF_HOME = Path.home() / ".cache" / "huggingface"
+    return (Path(HF_HOME) / "lerobot").expanduser()
+
+
+def default_dataset_root(repo_id: str) -> Path:
+    return default_lerobot_home() / repo_id
+
+
+def resolve_output_root(new_root: str | None, new_repo_id: str) -> Path:
+    if new_root:
+        return Path(new_root).expanduser()
+    return default_dataset_root(new_repo_id)
+
+
 def common_output_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--new-repo-id", "--new_repo_id", required=True, help="Output dataset repo id")
     parser.add_argument("--root", default=None, help="Input dataset root or common source root")
-    parser.add_argument("--new-root", "--new_root", required=True, help="Output dataset root")
+    parser.add_argument(
+        "--new-root",
+        "--new_root",
+        default=None,
+        help="Output dataset root. Defaults to $HF_LEROBOT_HOME/<new-repo-id>.",
+    )
     add_bool_arg(parser, "--push-to-hub", "--push_to_hub", default=False, help="Push output dataset to Hub")
     parser.add_argument("--dry-run", "--dry_run", action="store_true", help="Analyze/report without writing")
     parser.add_argument("--validate-only", "--validate_only", action="store_true", help="Validate without writing")
     parser.add_argument("--report-path", "--report_path", default=None, help="Optional JSON report path")
-

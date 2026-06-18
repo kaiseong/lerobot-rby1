@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from lerobot_dataset_tools.cli import common_output_args, ensure_lerobot_import_path
+from lerobot_dataset_tools.cli import common_output_args, ensure_lerobot_import_path, resolve_output_root
 
 ensure_lerobot_import_path()
 
@@ -30,7 +30,7 @@ def main() -> None:
         repo_id=args.repo_id,
         new_repo_id=args.new_repo_id,
         root=Path(args.root).expanduser() if args.root else None,
-        new_root=Path(args.new_root).expanduser(),
+        new_root=resolve_output_root(args.new_root, args.new_repo_id),
         keep_start_seconds=args.keep_start_seconds,
         keep_end_seconds=args.keep_end_seconds,
         state_key=args.state_key,
@@ -47,4 +47,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

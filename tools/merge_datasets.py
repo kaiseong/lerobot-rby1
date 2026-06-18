@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from lerobot_dataset_tools.cli import add_bool_arg, ensure_lerobot_import_path
+from lerobot_dataset_tools.cli import add_bool_arg, ensure_lerobot_import_path, resolve_output_root
 
 ensure_lerobot_import_path()
 
@@ -17,7 +17,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-id", "--repo_id", dest="new_repo_id", default=None, help="Output dataset repo id")
     parser.add_argument("--new-repo-id", "--new_repo_id", dest="new_repo_id", help="Output dataset repo id")
     parser.add_argument("--root", default=None, help="Optional common root for sources without '=ROOT'")
-    parser.add_argument("--new-root", "--new_root", required=True, help="Output dataset root")
+    parser.add_argument(
+        "--new-root",
+        "--new_root",
+        default=None,
+        help="Output dataset root. Defaults to $HF_LEROBOT_HOME/<new-repo-id>.",
+    )
     add_bool_arg(parser, "--push-to-hub", "--push_to_hub", default=False, help="Push output dataset to Hub")
     parser.add_argument("--dry-run", "--dry_run", action="store_true", help="Analyze/report without writing")
     parser.add_argument("--validate-only", "--validate_only", action="store_true", help="Validate without writing")
@@ -41,7 +46,7 @@ def main() -> None:
     config = MergeConfig(
         sources=sources,
         new_repo_id=args.new_repo_id,
-        new_root=Path(args.new_root).expanduser(),
+        new_root=resolve_output_root(args.new_root, args.new_repo_id),
         copy_workers=args.copy_workers,
         remux_policy=args.remux_policy,
         dry_run=args.dry_run,

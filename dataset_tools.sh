@@ -17,20 +17,19 @@ Usage:
 Examples:
   ./dataset_tools.sh trim \
     --repo-id rainbowrobotics/source \
-    --root /data/source \
     --new-repo-id rainbowrobotics/source_trimmed \
-    --new-root /data/source_trimmed \
     --workers auto \
     --dry-run
 
   ./dataset_tools.sh merge \
-    --source rainbowrobotics/a=/data/a \
-    --source rainbowrobotics/b=/data/b \
+    --source rainbowrobotics/a \
+    --source rainbowrobotics/b \
     --new-repo-id rainbowrobotics/merged \
-    --new-root /data/merged \
     --dry-run
 
 Notes:
+  - Input roots are optional when datasets are in the LeRobot cache or can be downloaded.
+  - Output root defaults to $HF_LEROBOT_HOME/<new-repo-id>.
   - trim is logical-only: it does not decode, physically trim, or re-encode videos.
   - merge defaults to no remux/re-encode; videos are copied.
   - Set PYTHON=/path/to/python if you do not want to use python3.
