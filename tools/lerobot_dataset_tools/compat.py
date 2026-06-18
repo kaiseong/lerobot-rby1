@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -116,6 +117,50 @@ def load_metadata(ref: DatasetRef):
     return load_dataset(ref, download_videos=False).meta
 
 
+def _normalize_version_tag(version: str | None) -> str | None:
+    if version is None:
+        return None
+    version = str(version).strip()
+    if not version:
+        return None
+    return version if version.startswith("v") else f"v{version}"
+
+
+def _read_info_codebase_version(ref: DatasetRef) -> str | None:
+    if ref.root is not None:
+        info_path = Path(ref.root) / "meta" / "info.json"
+        if info_path.exists():
+            with info_path.open("r", encoding="utf-8") as f:
+                return json.load(f).get("codebase_version")
+
+    from huggingface_hub import hf_hub_download
+
+    info_path = hf_hub_download(repo_id=ref.repo_id, filename="meta/info.json", repo_type="dataset")
+    with Path(info_path).open("r", encoding="utf-8") as f:
+        return json.load(f).get("codebase_version")
+
+
+def _repo_has_ref(repo_id: str, ref_name: str) -> bool:
+    from huggingface_hub import HfApi
+
+    refs = HfApi().list_repo_refs(repo_id, repo_type="dataset")
+    names = {ref.name for ref in refs.branches + refs.tags}
+    return ref_name in names
+
+
+def _ensure_codebase_version_tag(ref: DatasetRef) -> str | None:
+    tag = _normalize_version_tag(_read_info_codebase_version(ref))
+    if tag is None:
+        return None
+    if _repo_has_ref(ref.repo_id, tag):
+        return None
+
+    from huggingface_hub import HfApi
+
+    HfApi().create_tag(repo_id=ref.repo_id, tag=tag, repo_type="dataset")
+    return tag
+
+
 def episodes_to_pandas(episodes: Any) -> pd.DataFrame:
     if hasattr(episodes, "to_pandas"):
         return episodes.to_pandas()
@@ -194,8 +239,21 @@ def probe_dataset(ref: DatasetRef) -> tuple[Any | None, CompatibilityResult]:
         root = str(meta.root)
         codebase_version = info_get(meta.info, "codebase_version")
     except Exception as exc:
-        errors.append(f"metadata load failed: {exc}")
-        return None, CompatibilityResult("unsupported", warnings, errors, pkg_version, codebase_version, root)
+        load_error = exc
+        try:
+            created_tag = _ensure_codebase_version_tag(ref)
+            if created_tag:
+                warnings.append(f"Created missing Hub codebase version tag '{created_tag}' for {ref.repo_id}")
+                meta = load_metadata(ref)
+                root = str(meta.root)
+                codebase_version = info_get(meta.info, "codebase_version")
+            else:
+                raise load_error
+        except Exception as repair_exc:
+            errors.append(f"metadata load failed: {load_error}")
+            if repair_exc is not load_error:
+                errors.append(f"codebase version tag repair failed: {repair_exc}")
+            return None, CompatibilityResult("unsupported", warnings, errors, pkg_version, codebase_version, root)
 
     missing_info = sorted(REQUIRED_INFO_FIELDS - info_keys(meta.info))
     if missing_info:
