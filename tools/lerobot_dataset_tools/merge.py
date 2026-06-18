@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .cli import resolve_workers
-from .compat import DatasetRef, feature_map, probe_dataset, video_keys
+from .compat import DatasetRef, feature_map, load_dataset, probe_dataset, video_keys
 from .no_reencode import guard_no_reencode
 from .reporting import emit_report
 
@@ -115,6 +115,12 @@ def merge_datasets(config: MergeConfig) -> dict[str, Any]:
 
     if config.new_root.exists() and any(config.new_root.iterdir()):
         raise FileExistsError(f"Output root already exists and is not empty: {config.new_root}")
+
+    if any(video_keys(meta) for meta in metas):
+        metas = [
+            load_dataset(src, download_videos=True).meta
+            for src in config.sources
+        ]
 
     repo_ids = [src.repo_id for src in config.sources]
     roots = [meta.root for meta in metas]

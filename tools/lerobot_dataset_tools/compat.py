@@ -62,15 +62,31 @@ class CompatibilityResult:
 def import_lerobot_symbols() -> dict[str, Any]:
     dataset_mod = importlib.import_module("lerobot.datasets.lerobot_dataset")
     utils_mod = importlib.import_module("lerobot.datasets.utils")
+    try:
+        io_utils_mod = importlib.import_module("lerobot.datasets.io_utils")
+    except ModuleNotFoundError:
+        io_utils_mod = None
+
+    io_modules = [mod for mod in (io_utils_mod, utils_mod) if mod is not None]
+
+    def first_attr(name: str, *, required: bool = True):
+        for mod in io_modules:
+            if hasattr(mod, name):
+                return getattr(mod, name)
+        if required:
+            module_names = ", ".join(mod.__name__ for mod in io_modules)
+            raise AttributeError(f"{name} not found in {module_names}")
+        return None
+
     symbols = {
         "LeRobotDataset": getattr(dataset_mod, "LeRobotDataset"),
         "LeRobotDatasetMetadata": getattr(dataset_mod, "LeRobotDatasetMetadata"),
         "CODEBASE_VERSION": getattr(dataset_mod, "CODEBASE_VERSION", None),
-        "load_episodes": getattr(utils_mod, "load_episodes"),
-        "write_info": getattr(utils_mod, "write_info"),
-        "write_tasks": getattr(utils_mod, "write_tasks"),
-        "write_stats": getattr(utils_mod, "write_stats", None),
-        "write_episodes": getattr(utils_mod, "write_episodes", None),
+        "load_episodes": first_attr("load_episodes", required=False),
+        "write_info": first_attr("write_info"),
+        "write_tasks": first_attr("write_tasks"),
+        "write_stats": first_attr("write_stats", required=False),
+        "write_episodes": first_attr("write_episodes", required=False),
         "DEFAULT_DATA_PATH": getattr(utils_mod, "DEFAULT_DATA_PATH"),
         "DEFAULT_EPISODES_PATH": getattr(utils_mod, "DEFAULT_EPISODES_PATH"),
         "DEFAULT_VIDEO_PATH": getattr(utils_mod, "DEFAULT_VIDEO_PATH"),
@@ -87,10 +103,17 @@ def package_version() -> str | None:
         return None
 
 
-def load_metadata(ref: DatasetRef):
+def load_dataset(ref: DatasetRef, *, download_videos: bool = False):
     symbols = import_lerobot_symbols()
-    metadata_cls = symbols["LeRobotDatasetMetadata"]
-    return metadata_cls(ref.repo_id, root=ref.root)
+    dataset_cls = symbols["LeRobotDataset"]
+    try:
+        return dataset_cls(ref.repo_id, root=ref.root, download_videos=download_videos)
+    except TypeError:
+        return dataset_cls(ref.repo_id, root=ref.root)
+
+
+def load_metadata(ref: DatasetRef):
+    return load_dataset(ref, download_videos=False).meta
 
 
 def episodes_to_pandas(episodes: Any) -> pd.DataFrame:
@@ -105,8 +128,24 @@ def normalize_root(root: str | Path | None) -> Path | None:
     return Path(root).expanduser()
 
 
+def info_keys(info: Any) -> set[str]:
+    if isinstance(info, dict):
+        return set(info)
+    if hasattr(info, "to_dict"):
+        return set(info.to_dict())
+    return set(vars(info))
+
+
+def info_get(info: Any, key: str, default: Any = None) -> Any:
+    if isinstance(info, dict):
+        return info.get(key, default)
+    if hasattr(info, "get"):
+        return info.get(key, default)
+    return getattr(info, key, default)
+
+
 def feature_map(meta) -> dict[str, Any]:
-    return copy.deepcopy(meta.info["features"])
+    return copy.deepcopy(info_get(meta.info, "features", {}))
 
 
 def video_keys(meta) -> list[str]:
@@ -118,7 +157,7 @@ def camera_keys(meta) -> list[str]:
 
 
 def data_file_path(meta, ep_row: pd.Series) -> Path:
-    rel = meta.info["data_path"].format(
+    rel = info_get(meta.info, "data_path").format(
         chunk_index=int(ep_row["data/chunk_index"]),
         file_index=int(ep_row["data/file_index"]),
     )
@@ -126,7 +165,7 @@ def data_file_path(meta, ep_row: pd.Series) -> Path:
 
 
 def video_file_path(meta, video_key: str, chunk_index: int, file_index: int) -> Path:
-    video_path = meta.info.get("video_path")
+    video_path = info_get(meta.info, "video_path")
     if not video_path:
         raise ValueError("Dataset has video features but meta/info.json has no video_path")
     return Path(meta.root) / video_path.format(
@@ -153,12 +192,12 @@ def probe_dataset(ref: DatasetRef) -> tuple[Any | None, CompatibilityResult]:
     try:
         meta = load_metadata(ref)
         root = str(meta.root)
-        codebase_version = meta.info.get("codebase_version")
+        codebase_version = info_get(meta.info, "codebase_version")
     except Exception as exc:
         errors.append(f"metadata load failed: {exc}")
         return None, CompatibilityResult("unsupported", warnings, errors, pkg_version, codebase_version, root)
 
-    missing_info = sorted(REQUIRED_INFO_FIELDS - set(meta.info))
+    missing_info = sorted(REQUIRED_INFO_FIELDS - info_keys(meta.info))
     if missing_info:
         errors.append(f"meta/info.json missing required fields: {missing_info}")
 

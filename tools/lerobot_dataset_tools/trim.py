@@ -17,6 +17,7 @@ from .compat import (
     data_file_path,
     episodes_to_pandas,
     import_lerobot_symbols,
+    load_dataset,
     probe_dataset,
     video_file_path,
     video_keys,
@@ -334,6 +335,10 @@ def trim_stationary_dataset(config: TrimConfig) -> dict[str, Any]:
             report["existing_output_validated"] = False
         report["status"] = "validated"
         return emit_report(report, config.report_path)
+
+    if video_keys(meta):
+        meta = load_dataset(DatasetRef(config.repo_id, config.root), download_videos=True).meta
+        episodes_df = episodes_to_pandas(meta.episodes)
 
     with guard_no_reencode():
         result = _write_trimmed_dataset(config, meta, episodes_df, ranges)
