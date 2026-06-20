@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -80,8 +79,10 @@ def merge_datasets(config: MergeConfig) -> dict[str, Any]:
         raise ValueError("Only --remux-policy never is supported in the no-reencode first pass")
     workers = resolve_workers(config.copy_workers, len(config.sources))
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        probed = list(executor.map(_probe_source, config.sources))
+    # Probe source metadata in the main thread. Hugging Face downloads and LeRobot
+    # metadata loading both use tqdm internally; running many probes in worker
+    # threads can trip tqdm's process-wide lock initialization on some installs.
+    probed = [_probe_source(src) for src in config.sources]
     metas = [item[0] for item in probed]
     compat = [item[1].__dict__ for item in probed]
     validate_merge_sources(metas)
