@@ -31,6 +31,33 @@ python src/lerobot/async_inference/robot_client.py \
     --aggregate_fn_name=weighted_average \
     --debug_visualize_queue_size=True
 ```
+
+GR00T ZMQ example:
+
+python -m lerobot.async_inference.robot_client \
+  --backend=groot_zmq \
+  --robot.type=rby1 \
+  --server_address=192.168.0.3:5555  \
+  --task="pick up the can" \
+  --actions_per_chunk=50 \
+  --chunk_size_threshold=0.5 \
+  --aggregate_fn_name=weighted_average
+
+
+Pi05 Thor ZMQ example:
+
+python -m lerobot.async_inference.robot_client \
+  --backend=pi05_thor \
+  --robot.type=rby1 \
+  --server_address=192.168.0.3:5556 \
+  --task="move the object to the target" \
+  --actions_per_chunk=50 \
+  --chunk_size_threshold=0.5 \
+  --aggregate_fn_name=weighted_average
+
+
+
+
 """
 
 import logging
@@ -40,7 +67,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict
 from pprint import pformat
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any
 
 import draccus
@@ -65,6 +92,31 @@ from lerobot.transport import (
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
+
+
+from .policy.groot_zmq import (
+    GR00TZMQClient,
+    build_groot_n16_observation,
+    groot_n16_action_dict_to_timed_actions,
+    validate_groot_robot_compatibility,
+)
+
+from .policy.pi05_thor import (
+    Pi05ThorClient,
+    build_pi05_observation as build_pi05_thor_observation,
+    pi05_action_dict_to_timed_actions as pi05_thor_action_dict_to_timed_actions,
+    validate_pi05_robot_compatibility as validate_pi05_thor_robot_compatibility,
+)
+
+from .policy.pi05_zmq import (
+    Pi05ZMQClient,
+    build_pi05_observation as build_pi05_zmq_observation,
+    pi05_action_dict_to_timed_actions as pi05_zmq_action_dict_to_timed_actions,
+    validate_pi05_robot_compatibility as validate_pi05_zmq_robot_compatibility,
+)
+
+
+
 from .configs import RobotClientConfig
 from .helpers import (
     Action,
@@ -78,6 +130,35 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+
+REMOTE_ZMQ_BACKENDS = {
+    "groot_zmq": {
+        "label": "GR00T",
+        "client_cls": GR00TZMQClient,
+        "validator": validate_groot_robot_compatibility,
+        "build_observation": build_groot_n16_observation,
+        "convert_actions": groot_n16_action_dict_to_timed_actions,
+    },
+    "pi05_zmq": {
+        "label": "Pi05",
+        "client_cls": Pi05ZMQClient,
+        "validator": validate_pi05_zmq_robot_compatibility,
+        "build_observation": build_pi05_zmq_observation,
+        "convert_actions": pi05_zmq_action_dict_to_timed_actions,
+    },
+    "pi05_thor": {
+        "label": "Pi05 Thor",
+        "client_cls": Pi05ThorClient,
+        "validator": validate_pi05_thor_robot_compatibility,
+        "build_observation": build_pi05_thor_observation,
+        "convert_actions": pi05_thor_action_dict_to_timed_actions,
+    },
+    
+}
+
+def get_remote_backend_spec(backend: str) -> dict[str, Any] | None:
+    return REMOTE_ZMQ_BACKENDS.get(backend)
+
 
 
 class RobotClient:
@@ -94,24 +175,47 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+        self.backend = getattr(config, "backend", "grpc")
 
-        lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
+        self.policy_config = None
+        self.channel = None
+        self.stub = None
+        self.remote_client = None
 
         # Use environment variable if server_address is not provided in config
         self.server_address = config.server_address
 
-        self.policy_config = RemotePolicyConfig(
-            config.policy_type,
-            config.pretrained_name_or_path,
-            lerobot_features,
-            config.actions_per_chunk,
-            config.policy_device,
-        )
-        self.channel = grpc.insecure_channel(
-            self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
-        )
-        self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
-        self.logger.info(f"Initializing client to connect to server at {self.server_address}")
+        if self.uses_grpc_backend:
+            lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
+
+            self.policy_config = RemotePolicyConfig(
+                config.policy_type,
+                config.pretrained_name_or_path,
+                lerobot_features,
+                config.actions_per_chunk,
+                config.policy_device,
+            )
+            self.channel = grpc.insecure_channel(
+                self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
+            )
+            self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
+            self.logger.info(f"Initializing client to connect to server at {self.server_address}")
+
+        elif self.uses_remote_zmq_backend:
+            backend_spec = get_remote_backend_spec(self.backend)
+            if backend_spec is None:
+                raise ValueError(f"Unsupported remote backend: {self.backend}")
+
+            backend_spec["validator"](
+                self.robot,
+                front_camera_key=self.config.front_camera_key,
+                left_wrist_camera_key=self.config.left_wrist_camera_key,
+                right_wrist_camera_key=self.config.right_wrist_camera_key,
+            )
+
+            self.logger.info(
+                f"Initializing {backend_spec['label']} ZMQ client to connect to server at {self.server_address}"
+            )
 
         self.shutdown_event = threading.Event()
 
@@ -123,6 +227,9 @@ class RobotClient:
         self._chunk_size_threshold = config.chunk_size_threshold
 
         self.action_queue = Queue()
+        # Latest-only observation queue for async ZMQ inference.
+        # maxsize=1 avoids running inference on stale observations.
+        self.remote_observation_queue = Queue(maxsize=1)
         self.action_queue_lock = threading.Lock()  # Protect queue operations
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
@@ -139,28 +246,76 @@ class RobotClient:
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+    
+    @property
+    def uses_grpc_backend(self) -> bool:
+        return self.backend == "grpc"
+
+    @property
+    def uses_groot_backend(self) -> bool:
+        return self.backend == "groot_zmq"
+    
+    @property
+    def uses_pi05_backend(self) -> bool:
+        return self.backend in ("pi05_zmq", "pi05_thor")
+
+    @property
+    def uses_remote_zmq_backend(self) -> bool:
+        return self.backend in REMOTE_ZMQ_BACKENDS
+
+    @property
+    def remote_backend_name(self) -> str:
+        if self.uses_groot_backend:
+            return "GR00T"
+        if self.backend == "pi05_thor":
+            return "Pi05 Thor"
+        if self.uses_pi05_backend:
+            return "Pi05"
+        return "Remote"
 
     def start(self):
         """Start the robot client and connect to the policy server"""
         try:
-            # client-server handshake
-            start_time = time.perf_counter()
-            self.stub.Ready(services_pb2.Empty())
-            end_time = time.perf_counter()
-            self.logger.debug(f"Connected to policy server in {end_time - start_time:.4f}s")
+            if self.uses_grpc_backend:
+                # client-server handshake
+                start_time = time.perf_counter()
+                self.stub.Ready(services_pb2.Empty())
+                end_time = time.perf_counter()
+                self.logger.debug(f"Connected to policy server in {end_time - start_time:.4f}s")
 
-            # send policy instructions
-            policy_config_bytes = pickle.dumps(self.policy_config)
-            policy_setup = services_pb2.PolicySetup(data=policy_config_bytes)
+                # send policy instructions
+                policy_config_bytes = pickle.dumps(self.policy_config)
+                policy_setup = services_pb2.PolicySetup(data=policy_config_bytes)
 
-            self.logger.info("Sending policy instructions to policy server")
-            self.logger.debug(
-                f"Policy type: {self.policy_config.policy_type} | "
-                f"Pretrained name or path: {self.policy_config.pretrained_name_or_path} | "
-                f"Device: {self.policy_config.device}"
-            )
+                self.logger.info("Sending policy instructions to policy server")
+                self.logger.debug(
+                    f"Policy type: {self.policy_config.policy_type} | "
+                    f"Pretrained name or path: {self.policy_config.pretrained_name_or_path} | "
+                    f"Device: {self.policy_config.device}"
+                )
 
-            self.stub.SendPolicyInstructions(policy_setup)
+                self.stub.SendPolicyInstructions(policy_setup)
+
+            elif self.uses_remote_zmq_backend:
+                backend_spec = get_remote_backend_spec(self.backend)
+                if backend_spec is None:
+                    raise ValueError(f"Unsupported remote backend: {self.backend}")
+
+                self.remote_client = backend_spec["client_cls"](
+                    server_address=self.server_address,
+                    timeout_ms=self.config.zmq_timeout_ms,
+                )
+
+                error_name = backend_spec["label"]
+
+                if not self.remote_client.ping():
+                    self.logger.error(f"Failed to connect to {error_name} inference server")
+                    self.remote_client.close()
+                    self.remote_client = None
+                    return False
+
+            else:
+                raise ValueError(f"Unsupported backend: {self.backend}")
 
             self.shutdown_event.clear()
 
@@ -177,8 +332,14 @@ class RobotClient:
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
-        self.channel.close()
-        self.logger.debug("Client stopped, channel closed")
+        if self.channel is not None:
+            self.channel.close()
+            self.logger.debug("Client stopped, channel closed")
+
+        if self.remote_client is not None:
+            self.remote_client.close()
+            self.remote_client = None
+            self.logger.debug("Remote ZMQ client closed")
 
     def send_observation(
         self,
@@ -186,6 +347,8 @@ class RobotClient:
     ) -> bool:
         """Send observation to the policy server.
         Returns True if the observation was sent successfully, False otherwise."""
+        if not self.uses_grpc_backend:
+            raise RuntimeError("send_observation is only valid for the gRPC backend")
         if not self.running:
             raise RuntimeError("Client not running. Run RobotClient.start() before sending observations.")
 
@@ -267,7 +430,10 @@ class RobotClient:
             self.action_queue = future_action_queue
 
     def receive_actions(self, verbose: bool = False):
-        """Receive actions from the policy server"""
+        """Receive actions from the gRPC policy server"""
+        if not self.uses_grpc_backend:
+            self.logger.debug("receive_actions called for non-gRPC backend; skipping")
+            return
         # Wait at barrier for synchronized start
         self.start_barrier.wait()
         self.logger.info("Action receiving thread starting")
@@ -376,13 +542,16 @@ class RobotClient:
             self.action_queue_size.append(self.action_queue.qsize())
             # Get action from queue
             timed_action = self.action_queue.get_nowait()
+            # queue 많이 지우기
+            # timed_action = self.action_queue.get_nowait() 
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        action = self._action_tensor_to_action_dict(timed_action.get_action())
+
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+
+        _performed_action = self.robot.send_action(action)
 
         if verbose:
             with self.action_queue_lock:
@@ -455,10 +624,189 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
+
+    def _build_remote_observation(self, raw_observation: RawObservation) -> dict[str, Any]:
+        backend_spec = get_remote_backend_spec(self.backend)
+        if backend_spec is None:
+            raise ValueError(f"Unsupported remote backend: {self.backend}")
+
+        builder = backend_spec["build_observation"]
+        return builder(
+            raw_observation,
+            front_camera_key=self.config.front_camera_key,
+            left_wrist_camera_key=self.config.left_wrist_camera_key,
+            right_wrist_camera_key=self.config.right_wrist_camera_key,
+        )
+
+
+    def _convert_remote_actions(
+        self,
+        action_dict: dict[str, Any],
+        observation: TimedObservation,
+    ) -> list[TimedAction]:
+        backend_spec = get_remote_backend_spec(self.backend)
+        if backend_spec is None:
+            raise ValueError(f"Unsupported remote backend: {self.backend}")
+
+        converter = backend_spec["convert_actions"]
+        return converter(
+            action_dict,
+            timestamp=observation.get_timestamp(),
+            timestep=observation.get_timestep(),
+            environment_dt=self.config.environment_dt,
+            client_device=self.config.client_device,
+        )
+
+    def _put_latest_remote_observation(
+        self,
+        observation: TimedObservation,
+        remote_observation: dict[str, Any],
+    ) -> None:
+        """Keep only the most recent observation for async ZMQ inference."""
+        try:
+            self.remote_observation_queue.put_nowait((observation, remote_observation))
+            return
+        except Exception:
+            pass
+
+        try:
+            _ = self.remote_observation_queue.get_nowait()
+        except Empty:
+            pass
+        self.remote_observation_queue.put_nowait((observation, remote_observation))
+
+    def control_loop_remote_observation(self, task: str, verbose: bool = False) -> RawObservation | None:
+        """Capture an observation and enqueue it for the async ZMQ inference thread."""
+        if not self.uses_remote_zmq_backend:
+            raise RuntimeError("control_loop_remote_observation is only valid for the remote ZMQ backends")
+
+        try:
+            start_time = time.perf_counter()
+
+            raw_observation: RawObservation = self.robot.get_observation()
+            raw_observation["task"] = task
+
+            with self.latest_action_lock:
+                latest_action = self.latest_action
+
+            observation = TimedObservation(
+                timestamp=time.time(),
+                observation=raw_observation,
+                timestep=max(latest_action, 0),
+            )
+
+            obs_capture_time = time.perf_counter() - start_time
+
+            with self.action_queue_lock:
+                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+                current_queue_size = self.action_queue.qsize()
+
+            remote_observation = self._build_remote_observation(raw_observation)
+            self._put_latest_remote_observation(observation, remote_observation)
+
+            self.logger.debug(
+                f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go}) | "
+                f"Queued {self.remote_backend_name} observation #{observation.get_timestep()}"
+            )
+
+            if observation.must_go:
+                self.must_go.clear()
+
+            if verbose:
+                fps_metrics = self.fps_tracker.calculate_fps_metrics(observation.get_timestamp())
+
+                self.logger.info(
+                    f"Obs #{observation.get_timestep()} | "
+                    f"Avg FPS: {fps_metrics['avg_fps']:.2f} | "
+                    f"Target: {fps_metrics['target_fps']:.2f}"
+                )
+
+                self.logger.debug(
+                    f"Ts={observation.get_timestamp():.6f} | "
+                    f"Capturing observation took {obs_capture_time:.6f}s"
+                )
+
+            return raw_observation
+
+        except Exception as e:
+            self.logger.error(f"Error in {self.remote_backend_name} observation loop: {e}")
+            return None
+
+    def receive_remote_actions(self, verbose: bool = False):
+        """Receive actions from a remote ZMQ policy server in a background thread."""
+        if not self.uses_remote_zmq_backend:
+            self.logger.debug("receive_remote_actions called for non-ZMQ backend; skipping")
+            return
+        if self.remote_client is None:
+            raise RuntimeError(
+                f"{self.remote_backend_name} client not started. "
+                "Run RobotClient.start() before requesting actions."
+            )
+
+        self.start_barrier.wait()
+        self.logger.info(f"{self.remote_backend_name} action receiving thread starting")
+
+        while self.running:
+            try:
+                observation, remote_observation = self.remote_observation_queue.get(timeout=0.1)
+            except Empty:
+                continue
+
+            try:
+                request_start = time.perf_counter()
+                action_dict = self.remote_client.get_action(remote_observation)
+                request_time = time.perf_counter() - request_start
+
+                timed_actions = self._convert_remote_actions(action_dict, observation)
+                self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+
+                if verbose and timed_actions:
+                    old_size, old_timesteps = self._inspect_action_queue()
+                    if not old_timesteps:
+                        with self.latest_action_lock:
+                            old_timesteps = [self.latest_action]
+                else:
+                    old_size, old_timesteps = 0, []
+
+                queue_update_start = time.perf_counter()
+                self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+                queue_update_time = time.perf_counter() - queue_update_start
+
+                # After receiving actions, the next empty queue triggers must-go processing.
+                self.must_go.set()
+
+                self.logger.debug(
+                    f"{self.remote_backend_name} action request for obs #{observation.get_timestep()} "
+                    f"took {request_time * 1000:.2f}ms"
+                )
+
+                if verbose and timed_actions:
+                    new_size, new_timesteps = self._inspect_action_queue()
+                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
+
+                    self.logger.info(
+                        f"Received {self.remote_backend_name} action chunk for step #{incoming_timesteps[0]} | "
+                        f"Incoming actions: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
+                        f"Request time: {request_time * 1000:.2f}ms"
+                    )
+
+                    self.logger.debug(
+                        f"Queue update complete ({queue_update_time:.6f}s) | "
+                        f"Before: {old_size} items "
+                        f"({old_timesteps[:1] + old_timesteps[-1:] if old_timesteps else []}) | "
+                        f"After: {new_size} items "
+                        f"({new_timesteps[:1] + new_timesteps[-1:] if new_timesteps else []})"
+                    )
+
+            except Exception as e:
+                self.logger.error(f"Error in {self.remote_backend_name} action receiving loop: {e}")
+
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
         # Wait at barrier for synchronized start
-        self.start_barrier.wait()
+        if self.uses_grpc_backend or self.uses_remote_zmq_backend:
+            self.start_barrier.wait()
+        
         self.logger.info("Control loop thread starting")
 
         _performed_action = None
@@ -472,7 +820,15 @@ class RobotClient:
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                if self.uses_grpc_backend:
+                    _captured_observation = self.control_loop_observation(task, verbose)
+
+                elif self.uses_remote_zmq_backend:
+                    _captured_observation = self.control_loop_remote_observation(task, verbose)
+                else:
+                    raise ValueError(f"Unsupported backend: {self.backend}")
+
+                
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
@@ -492,13 +848,17 @@ def async_client(cfg: RobotClientConfig):
     client = RobotClient(cfg)
 
     if client.start():
-        client.logger.info("Starting action receiver thread...")
+        action_receiver_thread = None
 
-        # Create and start action receiver thread
-        action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+        if client.uses_grpc_backend:
+            client.logger.info("Starting gRPC action receiver thread...")
+            action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+            action_receiver_thread.start()
 
-        # Start action receiver thread
-        action_receiver_thread.start()
+        elif client.uses_remote_zmq_backend:
+            client.logger.info(f"Starting {client.remote_backend_name} ZMQ action receiver thread...")
+            action_receiver_thread = threading.Thread(target=client.receive_remote_actions, daemon=True)
+            action_receiver_thread.start()
 
         try:
             # The main thread runs the control loop
@@ -506,7 +866,11 @@ def async_client(cfg: RobotClientConfig):
 
         finally:
             client.stop()
-            action_receiver_thread.join()
+            if action_receiver_thread is not None:
+                if client.uses_remote_zmq_backend:
+                    action_receiver_thread.join(timeout=1.0)
+                else:
+                    action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")

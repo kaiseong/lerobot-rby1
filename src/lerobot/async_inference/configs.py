@@ -23,6 +23,8 @@ from .constants import (
     DEFAULT_FPS,
     DEFAULT_INFERENCE_LATENCY,
     DEFAULT_OBS_QUEUE_TIMEOUT,
+    DEFAULT_ZMQ_TIMEOUT_MS,
+    SUPPORTED_BACKENDS,
 )
 
 # Aggregate function registry for CLI usage
@@ -107,16 +109,22 @@ class RobotClientConfig:
     including network connection, policy settings, and control behavior.
     """
 
-    # Policy configuration
-    policy_type: str = field(metadata={"help": "Type of policy to use"})
-    pretrained_name_or_path: str = field(metadata={"help": "Pretrained model name or path"})
-
     # Robot configuration (for CLI usage - robot instance will be created from this)
     robot: RobotConfig = field(metadata={"help": "Robot configuration"})
 
     # Policies typically output K actions at max, but we can use less to avoid wasting bandwidth (as actions
     # would be aggregated on the client side anyway, depending on the value of `chunk_size_threshold`)
     actions_per_chunk: int = field(metadata={"help": "Number of actions per chunk"})
+
+    # Remote inference backend configuration
+    backend: str = field(
+        default="grpc",
+        metadata={"help": f"Remote backend to use. Options: {SUPPORTED_BACKENDS}"},
+    )
+
+    # Policy configuration
+    policy_type: str = field(default="act", metadata={"help": "Type of policy to use"})
+    pretrained_name_or_path: str = field(default="dummy", metadata={"help": "Pretrained model name or path"})
 
     # Task instruction for the robot to execute (e.g., 'fold my tshirt')
     task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
@@ -136,6 +144,28 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    image_crop_params: dict[str, tuple[int, int, int, int]] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Optional per-camera crop parameters as (top, left, height, width), applied on the client before sending observations"
+        },
+    )
+    zmq_timeout_ms: int = field(
+        default=DEFAULT_ZMQ_TIMEOUT_MS,
+        metadata={"help": "ZMQ send/recv timeout in milliseconds for remote ZMQ backends"},
+    )
+    front_camera_key: str = field(
+        default="front",
+        metadata={"help": "Robot observation key mapped to the front camera"},
+    )
+    right_wrist_camera_key: str = field(
+        default="right_wrist",
+        metadata={"help": "Robot observation key mapped to the right wrist camera"},
+    )
+    left_wrist_camera_key: str = field(
+        default="left_wrist",
+        metadata={"help": "Robot observation key mapped to the left wrist camera"},
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -155,17 +185,21 @@ class RobotClientConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if self.backend not in SUPPORTED_BACKENDS:
+            raise ValueError(f"backend must be one of {SUPPORTED_BACKENDS}, got {self.backend!r}")
+
         if not self.server_address:
             raise ValueError("server_address cannot be empty")
 
-        if not self.policy_type:
-            raise ValueError("policy_type cannot be empty")
+        if self.backend == "grpc":
+            if not self.policy_type:
+                raise ValueError("policy_type cannot be empty when backend='grpc'")
 
-        if not self.pretrained_name_or_path:
-            raise ValueError("pretrained_name_or_path cannot be empty")
+            if not self.pretrained_name_or_path:
+                raise ValueError("pretrained_name_or_path cannot be empty when backend='grpc'")
 
-        if not self.policy_device:
-            raise ValueError("policy_device cannot be empty")
+            if not self.policy_device:
+                raise ValueError("policy_device cannot be empty when backend='grpc'")
 
         if not self.client_device:
             raise ValueError("client_device cannot be empty")
@@ -179,6 +213,36 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.zmq_timeout_ms <= 0:
+            raise ValueError(f"zmq_timeout_ms must be positive, got {self.zmq_timeout_ms}")
+
+        if not self.front_camera_key:
+            raise ValueError("front_camera_key cannot be empty")
+
+        if not self.right_wrist_camera_key:
+            raise ValueError("right_wrist_camera_key cannot be empty")
+
+        if not self.left_wrist_camera_key:
+            raise ValueError("left_wrist_camera_key cannot be empty")
+
+        normalized_crop_params = {}
+        for key, value in self.image_crop_params.items():
+            if len(value) != 4:
+                raise ValueError(
+                    f"image_crop_params['{key}'] must have four values (top, left, height, width), got {value}"
+                )
+            top, left, height, width = (int(v) for v in value)
+            if top < 0 or left < 0:
+                raise ValueError(
+                    f"image_crop_params['{key}'] must use non-negative top/left offsets, got {value}"
+                )
+            if height <= 0 or width <= 0:
+                raise ValueError(
+                    f"image_crop_params['{key}'] must use positive height/width, got {value}"
+                )
+            normalized_crop_params[key] = (top, left, height, width)
+        self.image_crop_params = normalized_crop_params
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -189,6 +253,7 @@ class RobotClientConfig:
     def to_dict(self) -> dict:
         """Convert the configuration to a dictionary."""
         return {
+            "backend": self.backend,
             "server_address": self.server_address,
             "policy_type": self.policy_type,
             "pretrained_name_or_path": self.pretrained_name_or_path,
@@ -196,6 +261,11 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
+            "image_crop_params": self.image_crop_params,
+            "zmq_timeout_ms": self.zmq_timeout_ms,
+            "front_camera_key": self.front_camera_key,
+            "left_wrist_camera_key": self.left_wrist_camera_key,
+            "right_wrist_camera_key": self.right_wrist_camera_key,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
