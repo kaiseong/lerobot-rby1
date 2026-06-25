@@ -159,11 +159,11 @@ class RobotClientConfig:
         metadata={"help": "Robot observation key mapped to the front camera"},
     )
     right_wrist_camera_key: str = field(
-        default="right_wrist",
+        default="right",
         metadata={"help": "Robot observation key mapped to the right wrist camera"},
     )
     left_wrist_camera_key: str = field(
-        default="left_wrist",
+        default="left",
         metadata={"help": "Robot observation key mapped to the left wrist camera"},
     )
 
