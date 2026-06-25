@@ -401,12 +401,21 @@ class RobotClient:
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
 
-        for new_action in incoming_actions:
-            with self.latest_action_lock:
-                latest_action = self.latest_action
+        with self.latest_action_lock:
+            latest_action = self.latest_action
 
+        guard_steps = 2
+        guard_until = latest_action + guard_steps
+        for old_action in internal_queue:
+            if latest_action < old_action.get_timestep() <= guard_until:
+                future_action_queue.put(old_action)
+
+        for new_action in incoming_actions:
             # New action is older than the latest action in the queue, skip it
             if new_action.get_timestep() <= latest_action:
+                continue
+
+            if new_action.get_timestep() <= guard_until:
                 continue
 
             # If the new action's timestep is not in the current action queue, add it directly
