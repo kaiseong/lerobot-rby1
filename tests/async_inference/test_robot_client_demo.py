@@ -205,7 +205,7 @@ def test_ready_pose_worker_opens_grippers_before_ready_motion(monkeypatch):
 
     client._ready_pose_worker()
 
-    assert order == [("gripper", (0.0, 0.0)), ("ready", None)]
+    assert order == [("gripper", (0.0, 1.0)), ("ready", None)]
     assert client.ready_pose_in_progress is False
     assert client.pause_event.is_set()
     assert not client.must_go.is_set()

@@ -214,7 +214,9 @@ class DemoPi05RobotClient(RobotClient):
             return False
 
         try:
-            set_positions(np.zeros(2, dtype=np.float64))
+            # RB-Y1 gripper commands are side-specific in practice:
+            # right opens at 0.0, while the left opens at 1.0.
+            set_positions(np.array([0.0, 1.0], dtype=np.float64))
         except Exception as exc:
             self.logger.exception("Failed to open grippers for pause/ready transition: %s", exc)
             return False
