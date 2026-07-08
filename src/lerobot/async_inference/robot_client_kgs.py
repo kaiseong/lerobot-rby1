@@ -21,8 +21,6 @@ behind a separate entrypoint:
     python -m lerobot.async_inference.robot_client_kgs ...
 """
 
-from __future__ import annotations
-
 import logging
 import select
 import sys
