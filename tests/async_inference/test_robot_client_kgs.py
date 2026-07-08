@@ -84,7 +84,7 @@ class FakeTimedAction:
 def make_client():
     allow_async_import_without_grpcio()
 
-    from lerobot.async_inference.roboy_client_kgs import KgsPi05RobotClient
+    from lerobot.async_inference.robot_client_kgs import KgsPi05RobotClient
 
     client = object.__new__(KgsPi05RobotClient)
     client.config = SimpleNamespace(environment_dt=0.01, aggregate_fn=None)
@@ -105,7 +105,7 @@ def make_client():
     client.must_go = threading.Event()
     client.must_go.set()
     client.channel = None
-    client.logger = logging.getLogger("test_roboy_client_kgs")
+    client.logger = logging.getLogger("test_robot_client_kgs")
     client._init_kgs_pause_state()
     return client
 
@@ -308,7 +308,7 @@ def test_paused_or_readying_response_is_discarded_before_processing(monkeypatch,
 def test_non_tty_keyboard_startup_disables_listener(monkeypatch, caplog):
     allow_async_import_without_grpcio()
 
-    import lerobot.async_inference.roboy_client_kgs as kgs
+    import lerobot.async_inference.robot_client_kgs as kgs
 
     client = make_client()
     fake_stdin = SimpleNamespace(isatty=lambda: False)
@@ -325,7 +325,7 @@ def test_non_tty_keyboard_startup_disables_listener(monkeypatch, caplog):
 def test_terminal_restore_clears_saved_terminal_state(monkeypatch):
     allow_async_import_without_grpcio()
 
-    import lerobot.async_inference.roboy_client_kgs as kgs
+    import lerobot.async_inference.robot_client_kgs as kgs
 
     client = make_client()
     calls = []
@@ -344,7 +344,7 @@ def test_terminal_restore_clears_saved_terminal_state(monkeypatch):
 def test_kgs_backend_allowlist_accepts_pi05_backends(backend):
     allow_async_import_without_grpcio()
 
-    from lerobot.async_inference.roboy_client_kgs import validate_kgs_backend
+    from lerobot.async_inference.robot_client_kgs import validate_kgs_backend
 
     validate_kgs_backend(backend)
 
@@ -353,7 +353,7 @@ def test_kgs_backend_allowlist_accepts_pi05_backends(backend):
 def test_kgs_backend_allowlist_rejects_other_backends(backend):
     allow_async_import_without_grpcio()
 
-    from lerobot.async_inference.roboy_client_kgs import validate_kgs_backend
+    from lerobot.async_inference.robot_client_kgs import validate_kgs_backend
 
     with pytest.raises(ValueError, match="only supports remote Pi0.5"):
         validate_kgs_backend(backend)

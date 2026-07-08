@@ -18,7 +18,7 @@ This module intentionally leaves ``robot_client.py`` unchanged. It reuses the
 base ``RobotClient`` implementation and isolates RB-Y1/Pi0.5 operator controls
 behind a separate entrypoint:
 
-    python -m lerobot.async_inference.roboy_client_kgs ...
+    python -m lerobot.async_inference.robot_client_kgs ...
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ SUPPORTED_KGS_BACKENDS = {"pi05_zmq", "pi05_thor"}
 def validate_kgs_backend(backend: str) -> None:
     if backend not in SUPPORTED_KGS_BACKENDS:
         raise ValueError(
-            "roboy_client_kgs only supports remote Pi0.5 backends "
+            "robot_client_kgs only supports remote Pi0.5 backends "
             f"{sorted(SUPPORTED_KGS_BACKENDS)}, got {backend!r}"
         )
 
