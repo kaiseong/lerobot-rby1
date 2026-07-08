@@ -41,6 +41,7 @@ class FakeRobot:
         self.ready_calls = 0
         self.action_features = ["a", "b"]
         self.is_connected = True
+        self._gripper = FakeGripper()
 
     def move_to_ready_pose(self):
         self.ready_calls += 1
@@ -53,6 +54,14 @@ class FakeRobot:
 
     def disconnect(self):
         self.is_connected = False
+
+
+class FakeGripper:
+    def __init__(self):
+        self.position_calls = []
+
+    def set_positions(self, positions):
+        self.position_calls.append(tuple(float(x) for x in positions))
 
 
 class FakeRemoteClient:
@@ -84,9 +93,9 @@ class FakeTimedAction:
 def make_client():
     allow_async_import_without_grpcio()
 
-    from lerobot.async_inference.robot_client_kgs import KgsPi05RobotClient
+    from lerobot.async_inference.robot_client_demo import DemoPi05RobotClient
 
-    client = object.__new__(KgsPi05RobotClient)
+    client = object.__new__(DemoPi05RobotClient)
     client.config = SimpleNamespace(environment_dt=0.01, aggregate_fn=None)
     client.robot = FakeRobot()
     client.backend = "pi05_zmq"
@@ -105,8 +114,8 @@ def make_client():
     client.must_go = threading.Event()
     client.must_go.set()
     client.channel = None
-    client.logger = logging.getLogger("test_robot_client_kgs")
-    client._init_kgs_pause_state()
+    client.logger = logging.getLogger("test_robot_client_demo")
+    client._init_demo_pause_state()
     return client
 
 
@@ -177,6 +186,40 @@ def test_deferred_resume_after_failed_ready_pose_stays_paused():
     assert client.pause_event.is_set()
     assert not client.must_go.is_set()
     assert client.pause_generation == 3
+
+
+def test_ready_pose_worker_opens_grippers_before_ready_motion(monkeypatch):
+    client = make_client()
+    order = []
+
+    monkeypatch.setattr(
+        client.robot._gripper,
+        "set_positions",
+        lambda positions: order.append(("gripper", tuple(float(x) for x in positions))),
+    )
+    monkeypatch.setattr(client.robot, "move_to_ready_pose", lambda: order.append(("ready", None)))
+
+    client.pause_event.set()
+    client.ready_pose_in_progress = True
+    client.must_go.clear()
+
+    client._ready_pose_worker()
+
+    assert order == [("gripper", (0.0, 0.0)), ("ready", None)]
+    assert client.ready_pose_in_progress is False
+    assert client.pause_event.is_set()
+    assert not client.must_go.is_set()
+
+
+def test_pause_gripper_open_is_best_effort_when_gripper_missing(caplog):
+    client = make_client()
+    client.robot._gripper = None
+
+    with caplog.at_level(logging.INFO):
+        opened = client._open_grippers_for_pause()
+
+    assert opened is False
+    assert "gripper handle is unavailable" in caplog.text
 
 
 def test_control_loop_action_does_not_send_when_paused(monkeypatch):
@@ -308,11 +351,11 @@ def test_paused_or_readying_response_is_discarded_before_processing(monkeypatch,
 def test_non_tty_keyboard_startup_disables_listener(monkeypatch, caplog):
     allow_async_import_without_grpcio()
 
-    import lerobot.async_inference.robot_client_kgs as kgs
+    import lerobot.async_inference.robot_client_demo as demo
 
     client = make_client()
     fake_stdin = SimpleNamespace(isatty=lambda: False)
-    monkeypatch.setattr(kgs.sys, "stdin", fake_stdin)
+    monkeypatch.setattr(demo.sys, "stdin", fake_stdin)
 
     with caplog.at_level(logging.WARNING):
         enabled = client.start_keyboard_listener()
@@ -325,35 +368,35 @@ def test_non_tty_keyboard_startup_disables_listener(monkeypatch, caplog):
 def test_terminal_restore_clears_saved_terminal_state(monkeypatch):
     allow_async_import_without_grpcio()
 
-    import lerobot.async_inference.robot_client_kgs as kgs
+    import lerobot.async_inference.robot_client_demo as demo
 
     client = make_client()
     calls = []
-    monkeypatch.setattr(kgs.termios, "tcsetattr", lambda fd, when, attrs: calls.append((fd, when, attrs)))
+    monkeypatch.setattr(demo.termios, "tcsetattr", lambda fd, when, attrs: calls.append((fd, when, attrs)))
 
     client._terminal_fd = 7
     client._terminal_attrs = ["saved"]
     client._restore_terminal()
 
-    assert calls == [(7, kgs.termios.TCSADRAIN, ["saved"])]
+    assert calls == [(7, demo.termios.TCSADRAIN, ["saved"])]
     assert client._terminal_fd is None
     assert client._terminal_attrs is None
 
 
 @pytest.mark.parametrize("backend", ["pi05_zmq", "pi05_thor"])
-def test_kgs_backend_allowlist_accepts_pi05_backends(backend):
+def test_demo_backend_allowlist_accepts_pi05_backends(backend):
     allow_async_import_without_grpcio()
 
-    from lerobot.async_inference.robot_client_kgs import validate_kgs_backend
+    from lerobot.async_inference.robot_client_demo import validate_demo_backend
 
-    validate_kgs_backend(backend)
+    validate_demo_backend(backend)
 
 
 @pytest.mark.parametrize("backend", ["grpc", "groot_zmq"])
-def test_kgs_backend_allowlist_rejects_other_backends(backend):
+def test_demo_backend_allowlist_rejects_other_backends(backend):
     allow_async_import_without_grpcio()
 
-    from lerobot.async_inference.robot_client_kgs import validate_kgs_backend
+    from lerobot.async_inference.robot_client_demo import validate_demo_backend
 
     with pytest.raises(ValueError, match="only supports remote Pi0.5"):
-        validate_kgs_backend(backend)
+        validate_demo_backend(backend)
