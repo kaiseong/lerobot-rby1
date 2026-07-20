@@ -6,7 +6,6 @@ import torch
 
 from ..helpers import TimedAction
 
-
 ARM_DOF = 7
 GRIPPER_DOF = 1
 ACTION_DOF = 16
@@ -68,12 +67,22 @@ class Pi05ZMQClient:
         _, zmq = _import_zmq_dependencies()
         self._zmq = zmq
         self.address = normalize_zmq_server_address(server_address)
+        self.timeout_ms = int(timeout_ms)
         self.ctx = zmq.Context()
-        self.sock = self.ctx.socket(zmq.REQ)
-        self.sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self.sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self.sock.setsockopt(zmq.LINGER, 0)
-        self.sock.connect(self.address)
+        self.sock = self._create_socket()
+
+    def _create_socket(self):
+        sock = self.ctx.socket(self._zmq.REQ)
+        sock.setsockopt(self._zmq.RCVTIMEO, self.timeout_ms)
+        sock.setsockopt(self._zmq.SNDTIMEO, self.timeout_ms)
+        sock.setsockopt(self._zmq.LINGER, 0)
+        sock.connect(self.address)
+        return sock
+
+    def _reset_socket(self) -> None:
+        self.sock.setsockopt(self._zmq.LINGER, 0)
+        self.sock.close()
+        self.sock = self._create_socket()
 
     def _call(self, endpoint: str, data: dict[str, Any] | None = None):
         request: dict[str, Any] = {"endpoint": endpoint}
@@ -84,8 +93,10 @@ class Pi05ZMQClient:
             self.sock.send(MsgSerializer.to_bytes(request))
             raw = self.sock.recv()
         except self._zmq.Again as exc:
+            self._reset_socket()
             raise TimeoutError(f"Server response timeout (endpoint={endpoint})") from exc
         except self._zmq.ZMQError as exc:
+            self._reset_socket()
             raise RuntimeError(f"ZMQ error: {exc}") from exc
 
         response = MsgSerializer.from_bytes(raw)
@@ -106,7 +117,7 @@ class Pi05ZMQClient:
     ) -> dict[str, Any]:
         response = self._call("get_action", {"observation": observation, "options": options})
 
-        if isinstance(response, (list, tuple)) and len(response) >= 1:
+        if isinstance(response, list | tuple) and len(response) >= 1:
             return dict(tuple(response)[0])
         if isinstance(response, dict):
             return response
@@ -117,8 +128,13 @@ class Pi05ZMQClient:
         return self._call("reset", {"options": options})
 
     def close(self) -> None:
-        self.sock.close()
-        self.ctx.term()
+        if self.sock is not None:
+            self.sock.setsockopt(self._zmq.LINGER, 0)
+            self.sock.close()
+            self.sock = None
+        if self.ctx is not None:
+            self.ctx.term()
+            self.ctx = None
 
 
 def normalize_zmq_server_address(server_address: str) -> str:
