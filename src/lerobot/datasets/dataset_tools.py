@@ -42,7 +42,14 @@ import pyarrow.parquet as pq
 import torch
 from tqdm import tqdm
 
-from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, HF_LEROBOT_HOME, OBS_IMAGE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    DEFAULT_FEATURES,
+    HF_LEROBOT_HOME,
+    OBS_IMAGE,
+    OBS_IMAGES,
+    OBS_STATE,
+)
 from lerobot.utils.utils import flatten_dict
 
 from .aggregate import aggregate_datasets
@@ -70,9 +77,9 @@ from .utils import (
 )
 from .video_utils import decode_video_frames, encode_video_frames, get_video_info, resolve_vcodec
 
-
 _ARM_NAME_RE = re.compile(r"^(right|left)_arm_(\d+)(.*)$")
 _GRIPPER_NAME_RE = re.compile(r"^(right|left)_gripper_(\d+)(.*)$")
+_TASK_SIDE_RE = re.compile(r"\b(left|right)\b", re.IGNORECASE)
 _MIRROR_MODES = {"right_to_left", "left_to_right", "both"}
 _VISUAL_STORAGE_MODES = {"image", "video"}
 
@@ -523,6 +530,19 @@ def _swap_side(side: str) -> str:
     return "left" if side == "right" else "right"
 
 
+def _mirror_task_instruction(task: str) -> str:
+    def replace_side(match: re.Match) -> str:
+        source = match.group(0)
+        replacement = _swap_side(source.lower())
+        if source.isupper():
+            return replacement.upper()
+        if source.istitle():
+            return replacement.title()
+        return replacement
+
+    return _TASK_SIDE_RE.sub(replace_side, task)
+
+
 def _parse_sided_name(name: str) -> tuple[str, str, int, str] | None:
     arm_match = _ARM_NAME_RE.match(name)
     if arm_match:
@@ -804,6 +824,7 @@ def mirror_arm_dataset(
     visual_storage: str = "image",
     image_writer_processes: int = 0,
     image_writer_threads: int | None = None,
+    mirror_task_sides: bool = True,
 ) -> LeRobotDataset:
     """Create a mirrored arm dataset for left/right symmetric robot data augmentation.
 
@@ -812,7 +833,8 @@ def mirror_arm_dataset(
     are swapped according to ``mirror_mode``; arm indices in ``sign_flip_indices``
     have their signs inverted. Gripper dimensions are swapped without sign changes.
     Configured cameras are horizontally flipped, with right/left camera streams
-    swapped before writing the output dataset.
+    swapped before writing the output dataset. By default, standalone ``left`` and
+    ``right`` words in mirrored task instructions are swapped while preserving case.
     """
     if mirror_mode not in _MIRROR_MODES:
         raise ValueError(
@@ -828,7 +850,7 @@ def mirror_arm_dataset(
         )
 
     if sign_flip_indices is None:
-        sign_flip_indices = [1, 2, 4]
+        sign_flip_indices = [1, 2, 4, 6]
     sign_flip_set = set(sign_flip_indices)
     if any(idx < 0 for idx in sign_flip_set):
         raise ValueError("sign_flip_indices must be non-negative")
@@ -891,6 +913,11 @@ def mirror_arm_dataset(
         if key not in DEFAULT_FEATURES and key not in dataset.meta.camera_keys
     ]
     task_lookup = {int(row.task_index): task for task, row in dataset.meta.tasks.iterrows()}
+    mirrored_task_lookup = (
+        {task_index: _mirror_task_instruction(task) for task_index, task in task_lookup.items()}
+        if mirror_task_sides
+        else task_lookup
+    )
     image_hf_dataset = dataset.hf_dataset.with_format(None) if dataset.meta.image_keys else None
 
     cached_data_path = None
@@ -922,8 +949,9 @@ def mirror_arm_dataset(
             variants.insert(0, "original")
 
         for variant in variants:
+            variant_task_lookup = mirrored_task_lookup if variant == "mirror" else task_lookup
             for frame_idx in range(len(ep_df)):
-                frame = {"task": task_lookup[int(task_indices[frame_idx])]}
+                frame = {"task": variant_task_lookup[int(task_indices[frame_idx])]}
 
                 for key in feature_keys_to_copy:
                     value = per_feature_values[key][frame_idx]

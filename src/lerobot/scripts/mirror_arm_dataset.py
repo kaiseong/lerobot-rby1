@@ -39,6 +39,8 @@ class MirrorArmDatasetConfig:
     mirror_mode: str = "right_to_left"
     # Include the original episode before each mirrored episode. Only valid for mirror_mode="both".
     include_original: bool = False
+    # Swap standalone left/right words in mirrored task instructions.
+    mirror_task_sides: bool = True
     # Vector feature keys.
     state_key: str = "observation.state"
     action_key: str = "action"
@@ -47,7 +49,7 @@ class MirrorArmDatasetConfig:
     right_camera_key: str | None = "observation.images.right"
     left_camera_key: str | None = "observation.images.left"
     # Per-arm zero-based joint indices whose sign changes under left/right mirroring.
-    sign_flip_indices: list[int] = field(default_factory=lambda: [1, 2, 4])
+    sign_flip_indices: list[int] = field(default_factory=lambda: [1, 2, 4, 6])
     # Output camera storage. "image" writes PNG frames and avoids extra video compression.
     visual_storage: str = "image"
     # Async image writer settings. None uses a CPU-aware default; 0 disables threads.
@@ -78,6 +80,7 @@ def run_mirror_arm_dataset(cfg: MirrorArmDatasetConfig) -> LeRobotDataset:
         repo_id=output_repo_id,
         mirror_mode=cfg.mirror_mode,
         include_original=cfg.include_original,
+        mirror_task_sides=cfg.mirror_task_sides,
         state_key=cfg.state_key,
         action_key=cfg.action_key,
         front_camera_key=cfg.front_camera_key,

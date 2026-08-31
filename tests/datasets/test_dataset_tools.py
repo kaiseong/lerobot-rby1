@@ -329,7 +329,7 @@ def _create_rby1_bimanual_image_dataset(tmp_path, empty_lerobot_dataset_factory)
             "observation.images.front": _rby1_image(70),
             "observation.images.right": _rby1_image(90),
             "observation.images.left": _rby1_image(110),
-            "task": "bimanual task",
+            "task": "Move flowers from the right box into the left box.",
         }
     )
     dataset.save_episode()
@@ -364,11 +364,11 @@ def test_mirror_arm_dataset_right_to_left_image_dataset(tmp_path, empty_lerobot_
     item = mirrored[0]
     np.testing.assert_allclose(
         item["action"].numpy(),
-        np.array([100, 0, -1, -2, 3, -4, 5, 6, 0.25], dtype=np.float32),
+        np.array([100, 0, -1, -2, 3, -4, 5, -6, 0.25], dtype=np.float32),
     )
     np.testing.assert_allclose(
         item["observation.state"].numpy(),
-        np.array([200, 10, -11, -12, 13, -14, 15, 16, -21, -22, 0.75], dtype=np.float32),
+        np.array([200, 10, -11, -12, 13, -14, 15, -16, -21, -22, 0.75], dtype=np.float32),
     )
 
     np.testing.assert_allclose(
@@ -388,7 +388,7 @@ def test_mirror_arm_dataset_right_to_left_image_dataset(tmp_path, empty_lerobot_
     )
     assert mirrored.meta.total_episodes == dataset.meta.total_episodes
     assert mirrored.meta.total_frames == dataset.meta.total_frames
-    assert mirrored[0]["task"] == "pick object with the right arm"
+    assert mirrored[0]["task"] == "pick object with the left arm"
 
 
 def test_mirror_arm_dataset_both_can_include_original(tmp_path, empty_lerobot_dataset_factory):
@@ -408,10 +408,27 @@ def test_mirror_arm_dataset_both_can_include_original(tmp_path, empty_lerobot_da
     np.testing.assert_allclose(
         mirrored[1]["action"].numpy(),
         np.array(
-            [100, 10, -11, -12, 13, -14, 15, 16, 0.75, 0, -1, -2, 3, -4, 5, 6, 0.25],
+            [100, 10, -11, -12, 13, -14, 15, -16, 0.75, 0, -1, -2, 3, -4, 5, -6, 0.25],
             dtype=np.float32,
         ),
     )
+
+    assert mirrored[0]["task"] == "Move flowers from the right box into the left box."
+    assert mirrored[1]["task"] == "Move flowers from the left box into the right box."
+
+
+def test_mirror_arm_dataset_can_preserve_task_instruction(tmp_path, empty_lerobot_dataset_factory):
+    dataset, _, _ = _create_rby1_right_image_dataset(tmp_path, empty_lerobot_dataset_factory)
+
+    mirrored = mirror_arm_dataset(
+        dataset,
+        output_dir=tmp_path / "rby1_task_unchanged",
+        repo_id="test/rby1_task_unchanged",
+        mirror_mode="right_to_left",
+        mirror_task_sides=False,
+    )
+
+    assert mirrored[0]["task"] == "pick object with the right arm"
 
 
 def test_mirror_arm_dataset_both_requires_counterpart(tmp_path, empty_lerobot_dataset_factory):
@@ -442,7 +459,7 @@ def test_mirror_arm_dataset_video_smoke(tmp_path, empty_lerobot_dataset_factory)
     assert mirrored.meta.image_keys == dataset.meta.video_keys
     np.testing.assert_allclose(
         mirrored[0]["action"].numpy(),
-        np.array([100, 0, -1, -2, 3, -4, 5, 6, 0.25], dtype=np.float32),
+        np.array([100, 0, -1, -2, 3, -4, 5, -6, 0.25], dtype=np.float32),
     )
     for image_key in mirrored.meta.image_keys:
         assert image_key in mirrored[0]

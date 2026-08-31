@@ -23,6 +23,13 @@ from lerobot.scripts import mirror_arm_dataset as mirror_script
 from lerobot.scripts.mirror_arm_dataset import MirrorArmDatasetConfig, run_mirror_arm_dataset
 
 
+def test_mirror_arm_dataset_config_uses_rby1_mirror_defaults():
+    cfg = MirrorArmDatasetConfig(repo_id="test/input")
+
+    assert cfg.sign_flip_indices == [1, 2, 4, 6]
+    assert cfg.mirror_task_sides is True
+
+
 def test_mirror_arm_dataset_config_parses_list_options():
     cfg = draccus.parse(
         MirrorArmDatasetConfig,
@@ -75,7 +82,8 @@ def test_run_mirror_arm_dataset_passes_config_and_pushes(monkeypatch, tmp_path):
         new_root=str(output_root),
         mirror_mode="both",
         include_original=True,
-        sign_flip_indices=[1, 2, 4],
+        mirror_task_sides=False,
+        sign_flip_indices=[1, 2, 4, 6],
         visual_storage="image",
         image_writer_threads=8,
         image_writer_processes=0,
@@ -87,7 +95,8 @@ def test_run_mirror_arm_dataset_passes_config_and_pushes(monkeypatch, tmp_path):
     assert captured["repo_id"] == "test/output"
     assert captured["mirror_mode"] == "both"
     assert captured["include_original"] is True
-    assert captured["sign_flip_indices"] == [1, 2, 4]
+    assert captured["mirror_task_sides"] is False
+    assert captured["sign_flip_indices"] == [1, 2, 4, 6]
     assert captured["visual_storage"] == "image"
     assert captured["image_writer_threads"] == 8
     assert captured["image_writer_processes"] == 0
