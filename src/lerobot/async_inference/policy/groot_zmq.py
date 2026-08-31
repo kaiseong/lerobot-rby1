@@ -46,6 +46,7 @@ class MsgSerializer:
             data,
             object_hook=MsgSerializer._decode,
             strict_map_key=False,
+            raw=False,
         )
 
     @staticmethod
@@ -60,8 +61,45 @@ class MsgSerializer:
     def _decode(obj):
         if not isinstance(obj, dict):
             return obj
-        if "__ndarray_class__" in obj:
-            return np.load(io.BytesIO(obj["as_npy"]), allow_pickle=False)
+
+        # Legacy GR00T serializer used by older policy servers.
+        marker = obj.get("__ndarray_class__", obj.get(b"__ndarray_class__"))
+        if marker:
+            payload = obj.get("as_npy", obj.get(b"as_npy"))
+            if payload is None:
+                raise ValueError("Malformed legacy ndarray payload: missing 'as_npy'")
+            return np.load(io.BytesIO(payload), allow_pickle=False)
+
+        # GR00T N1.7 serializes NumPy values with msgpack-numpy. Decode the
+        # numeric subset here instead of adding msgpack-numpy to the robot
+        # client runtime. Without this, an action ndarray remains a dict and
+        # later fails in np.asarray(..., dtype=np.float32).
+        ndarray_marker = obj.get(b"nd", obj.get("nd"))
+        if ndarray_marker is not None:
+            dtype_value = obj.get(b"type", obj.get("type"))
+            data = obj.get(b"data", obj.get("data"))
+            if dtype_value is None or data is None:
+                raise ValueError("Malformed msgpack-numpy payload: missing dtype or data")
+
+            dtype = np.dtype(dtype_value)
+            if dtype.hasobject:
+                raise ValueError("Refusing to decode an object-dtype ndarray payload")
+
+            values = np.frombuffer(data, dtype=dtype)
+            if ndarray_marker is True:
+                shape = obj.get(b"shape", obj.get("shape"))
+                if shape is None:
+                    raise ValueError("Malformed msgpack-numpy ndarray payload: missing shape")
+                return values.reshape(tuple(shape))
+            return values[0]
+
+        complex_marker = obj.get(b"complex", obj.get("complex"))
+        if complex_marker is True:
+            data = obj.get(b"data", obj.get("data"))
+            if data is None:
+                raise ValueError("Malformed msgpack-numpy complex payload: missing data")
+            return complex(data.decode() if isinstance(data, bytes) else data)
+
         return obj
 
 
