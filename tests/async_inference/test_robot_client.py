@@ -19,6 +19,7 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import threading
 import time
 from queue import Queue
 
@@ -91,7 +92,7 @@ def _make_actions(start_ts: float, start_t: int, count: int):
 # -----------------------------------------------------------------------------
 
 
-def test_update_action_queue_discards_stale(robot_client):
+def test_update_action_queue_discards_stale_without_dropping_new_guard_steps(robot_client):
     """`_update_action_queue` must drop actions with `timestep` <= `latest_action`."""
 
     # Pretend we already executed up to action #4
@@ -106,6 +107,14 @@ def test_update_action_queue_discards_stale(robot_client):
     resulting_timesteps = [a.get_timestep() for a in robot_client.action_queue.queue]
 
     assert resulting_timesteps == [5, 6, 7]
+
+
+def test_update_action_queue_keeps_full_initial_chunk(robot_client):
+    incoming = _make_actions(start_ts=time.time(), start_t=0, count=40)
+
+    robot_client._aggregate_action_queues(incoming)
+
+    assert [a.get_timestep() for a in robot_client.action_queue.queue] == list(range(40))
 
 
 @pytest.mark.parametrize(
@@ -129,10 +138,11 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
 
     robot_client.chunks_received = 0
 
-    # Pretend we already executed up to action #4, and queue contains actions for timesteps 5..6
+    # Pretend we already executed up to action #4. Existing 5..6 are protected
+    # from replacement, while later overlaps are aggregated.
     robot_client.latest_action = 4
     current_actions = _make_actions(
-        start_ts=time.time(), start_t=5, count=2
+        start_ts=time.time(), start_t=5, count=4
     )  # actions are [torch.ones(6), torch.ones(6), ...]
     current_actions = [
         TimedAction(action=10 * a.get_action(), timestep=a.get_timestep(), timestamp=a.get_timestamp())
@@ -142,36 +152,111 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
     for a in current_actions:
         robot_client.action_queue.put(a)
 
-    # Incoming chunk contains timesteps 3..7 -> expect 5,6,7 kept.
-    incoming = _make_actions(start_ts=time.time(), start_t=3, count=5)  # 3,4,5,6,7
+    incoming = _make_actions(start_ts=time.time(), start_t=3, count=7)  # 3..9
 
-    overlap_timesteps = [5, 6]  # properly tested in test_aggregate_action_queues_discards_stale
-    nonoverlap_timesteps = [7]
+    protected_timesteps = [5, 6]
+    overlap_timesteps = [7, 8]
+    nonoverlap_timesteps = [9]
 
     robot_client._aggregate_action_queues(
         incoming, aggregate_fn=lambda x1, x2: weight_old * x1 + weight_new * x2
     )
 
     queue_overlap_actions = []
+    queue_protected_actions = []
     queue_non_overlap_actions = []
     for a in robot_client.action_queue.queue:
-        if a.get_timestep() in overlap_timesteps:
+        if a.get_timestep() in protected_timesteps:
+            queue_protected_actions.append(a)
+        elif a.get_timestep() in overlap_timesteps:
             queue_overlap_actions.append(a)
         elif a.get_timestep() in nonoverlap_timesteps:
             queue_non_overlap_actions.append(a)
 
     queue_overlap_actions = sorted(queue_overlap_actions, key=lambda x: x.get_timestep())
+    queue_protected_actions = sorted(queue_protected_actions, key=lambda x: x.get_timestep())
     queue_non_overlap_actions = sorted(queue_non_overlap_actions, key=lambda x: x.get_timestep())
 
+    assert torch.equal(queue_protected_actions[0].get_action(), current_actions[0].get_action())
+    assert torch.equal(queue_protected_actions[1].get_action(), current_actions[1].get_action())
     assert torch.allclose(
         queue_overlap_actions[0].get_action(),
-        weight_old * current_actions[0].get_action() + weight_new * incoming[-3].get_action(),
+        weight_old * current_actions[2].get_action() + weight_new * incoming[-3].get_action(),
     )
     assert torch.allclose(
         queue_overlap_actions[1].get_action(),
-        weight_old * current_actions[1].get_action() + weight_new * incoming[-2].get_action(),
+        weight_old * current_actions[3].get_action() + weight_new * incoming[-2].get_action(),
     )
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
+
+
+def test_consumption_and_aggregation_are_atomic(robot_client):
+    """Aggregation must not iterate/reinsert a queue while it is being consumed."""
+    entered_aggregation = threading.Event()
+    release_aggregation = threading.Event()
+    original_actions = _make_actions(start_ts=time.time(), start_t=0, count=4)
+
+    original_get_timestep = original_actions[0].get_timestep
+
+    def blocking_get_timestep():
+        if threading.current_thread().name == "aggregator" and not entered_aggregation.is_set():
+            entered_aggregation.set()
+            assert release_aggregation.wait(timeout=1)
+        return original_get_timestep()
+
+    original_actions[0].get_timestep = blocking_get_timestep
+    for action in original_actions:
+        robot_client.action_queue.put(action)
+
+    errors = []
+    aggregate_thread = threading.Thread(
+        name="aggregator",
+        target=lambda: _record_thread_error(
+            errors,
+            robot_client._aggregate_action_queues,
+            _make_actions(start_ts=time.time(), start_t=0, count=6),
+        ),
+    )
+    consume_thread = threading.Thread(
+        name="consumer",
+        target=lambda: _record_thread_error(errors, robot_client.control_loop_action),
+    )
+
+    aggregate_thread.start()
+    assert entered_aggregation.wait(timeout=1)
+    consume_thread.start()
+    time.sleep(0.02)
+    assert consume_thread.is_alive()
+    release_aggregation.set()
+    aggregate_thread.join(timeout=1)
+    consume_thread.join(timeout=1)
+
+    assert errors == []
+    assert robot_client.latest_action == 0
+    assert [a.get_timestep() for a in robot_client.action_queue.queue] == [1, 2, 3, 4, 5]
+
+
+def test_control_loop_action_tolerates_queue_depleted_after_availability_check(
+    robot_client, monkeypatch
+):
+    action = _make_actions(start_ts=time.time(), start_t=0, count=1)[0]
+    robot_client.action_queue.put(action)
+    assert robot_client.actions_available()
+
+    robot_client.action_queue.get_nowait()
+    sent_actions = []
+    monkeypatch.setattr(robot_client.robot, "send_action", sent_actions.append)
+
+    assert robot_client.control_loop_action() is None
+    assert sent_actions == []
+    assert robot_client.latest_action == -1
+
+
+def _record_thread_error(errors, function, *args):
+    try:
+        function(*args)
+    except Exception as exc:
+        errors.append(exc)
 
 
 @pytest.mark.parametrize(

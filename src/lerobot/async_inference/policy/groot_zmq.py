@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import io
+from contextlib import suppress
 from typing import Any
 
 import numpy as np
 import torch
 
 from ..helpers import TimedAction
-
 
 GROOT_N16_RIGHT_ARM_KEYS = [f"right_arm_{i}" for i in range(7)]
 GROOT_N16_LEFT_ARM_KEYS = [f"left_arm_{i}" for i in range(7)]
@@ -108,25 +108,51 @@ class GR00TZMQClient:
         _, zmq = _import_zmq_dependencies()
         self._zmq = zmq
         self.address = normalize_zmq_server_address(server_address)
+        self.timeout_ms = timeout_ms
+        self._closed = False
 
         self.ctx = zmq.Context()
-        self.sock = self.ctx.socket(zmq.REQ)
-        self.sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self.sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self.sock.setsockopt(zmq.LINGER, 0)
-        self.sock.connect(self.address)
+        self.sock = self._make_socket()
+
+    def _make_socket(self):
+        sock = self.ctx.socket(self._zmq.REQ)
+        sock.setsockopt(self._zmq.RCVTIMEO, self.timeout_ms)
+        sock.setsockopt(self._zmq.SNDTIMEO, self.timeout_ms)
+        sock.setsockopt(self._zmq.LINGER, 0)
+        sock.connect(self.address)
+        return sock
+
+    def _recover_socket(self) -> None:
+        """Discard a REQ socket whose send/receive state is no longer usable."""
+        old_socket = self.sock
+        self.sock = None
+        if old_socket is not None:
+            old_socket.close(linger=0)
+        if not self._closed:
+            self.sock = self._make_socket()
 
     def _call(self, endpoint: str, data: dict[str, Any] | None = None):
         request: dict[str, Any] = {"endpoint": endpoint}
         if data is not None:
             request["data"] = data
 
+        if self._closed:
+            raise RuntimeError("GR00T ZMQ client is closed")
+        if self.sock is None:
+            self.sock = self._make_socket()
+
         try:
             self.sock.send(MsgSerializer.to_bytes(request))
             raw = self.sock.recv()
         except self._zmq.Again as exc:
+            # Preserve the request failure as the meaningful error. A later
+            # call will retry socket construction if the context is usable.
+            with suppress(Exception):
+                self._recover_socket()
             raise TimeoutError(f"Server response timeout (endpoint={endpoint})") from exc
         except self._zmq.ZMQError as exc:
+            with suppress(Exception):
+                self._recover_socket()
             raise RuntimeError(f"ZMQ error: {exc}") from exc
 
         response = MsgSerializer.from_bytes(raw)
@@ -163,7 +189,12 @@ class GR00TZMQClient:
         return self._call("get_modality_config")
 
     def close(self) -> None:
-        self.sock.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self.sock is not None:
+            self.sock.close(linger=0)
+            self.sock = None
         self.ctx.term()
 
 
