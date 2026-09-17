@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -16,6 +17,124 @@ import_utils._require_package_cache["grpc"] = True
 
 from lerobot.async_inference.policy import pi05_zmq
 from lerobot.async_inference.policy.pi05_zmq import MsgSerializer, Pi05ZMQClient
+
+
+def test_cancellable_request_interrupts_long_wait_and_next_request_recovers():
+    ctx = zmq.Context()
+    server = ctx.socket(zmq.REP)
+    port = server.bind_to_random_port("tcp://127.0.0.1")
+    server.close(linger=0)
+    cancelled = threading.Event()
+    received = threading.Event()
+    release = threading.Event()
+    ready = threading.Event()
+    errors = []
+
+    def serve():
+        sock = ctx.socket(zmq.REP)
+        sock.setsockopt(zmq.RCVTIMEO, 2000)
+        try:
+            sock.bind(f"tcp://127.0.0.1:{port}")
+            ready.set()
+            sock.recv()
+            received.set()
+            assert release.wait(2)
+            sock.send(MsgSerializer.to_bytes({"actions": "stale"}))
+            sock.recv()
+            sock.send(MsgSerializer.to_bytes({"actions": "fresh"}))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            sock.close(linger=0)
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    client = Pi05ZMQClient(f"127.0.0.1:{port}", 90000, cancelled=cancelled.is_set)
+
+    def cancel_after_receive():
+        if received.wait(2):
+            cancelled.set()
+
+    interrupter = threading.Thread(target=cancel_after_receive)
+    interrupter.start()
+    try:
+        assert ready.wait(2)
+        started = time.monotonic()
+        with pytest.raises(InterruptedError):
+            client.get_action({})
+        assert time.monotonic() - started < 2
+        cancelled.clear()
+        release.set()
+        assert client.get_action({}) == {"actions": "fresh"}
+    finally:
+        release.set()
+        client.close()
+        worker.join(timeout=3)
+        interrupter.join(timeout=3)
+        ctx.term()
+    assert not worker.is_alive()
+    assert not errors
+
+
+def test_short_ping_timeout_keeps_long_inference_timeout():
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REP)
+    port = sock.bind_to_random_port("tcp://127.0.0.1")
+    sock.close(linger=0)
+    client = Pi05ZMQClient(f"127.0.0.1:{port}", 90000, cancelled=lambda: False)
+    try:
+        started = time.monotonic()
+        assert not client.ping(timeout_ms=50)
+        assert time.monotonic() - started < 1
+        assert client.timeout_ms == 90000
+    finally:
+        client.close()
+        ctx.term()
+
+
+def test_cancellable_client_recovers_after_server_restart():
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REP)
+    port = sock.bind_to_random_port("tcp://127.0.0.1")
+    sock.close(linger=0)
+    errors = []
+
+    def serve_once(ready, value):
+        server = ctx.socket(zmq.REP)
+        server.setsockopt(zmq.RCVTIMEO, 2000)
+        try:
+            server.bind(f"tcp://127.0.0.1:{port}")
+            ready.set()
+            server.recv()
+            server.send(MsgSerializer.to_bytes(value))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            server.close(linger=100)
+
+    ready = threading.Event()
+    first = threading.Thread(target=serve_once, args=(ready, True))
+    first.start()
+    client = Pi05ZMQClient(f"127.0.0.1:{port}", 1000, cancelled=lambda: False)
+    second = None
+    try:
+        assert ready.wait(2)
+        assert client.ping()
+        first.join(timeout=2)
+        assert not first.is_alive()
+        assert not client.ping(timeout_ms=50)
+        ready.clear()
+        second = threading.Thread(target=serve_once, args=(ready, {"actions": "after-restart"}))
+        second.start()
+        assert ready.wait(2)
+        assert client.get_action({}) == {"actions": "after-restart"}
+    finally:
+        client.close()
+        first.join(timeout=3)
+        if second is not None:
+            second.join(timeout=3)
+        ctx.term()
+    assert not errors
 
 
 class FakeSocket:

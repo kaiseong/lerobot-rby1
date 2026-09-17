@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import types
+from dataclasses import dataclass
 from queue import Queue
 from types import SimpleNamespace
 
@@ -400,3 +401,179 @@ def test_demo_backend_allowlist_rejects_other_backends(backend):
 
     with pytest.raises(ValueError, match="only supports remote Pi0.5"):
         validate_demo_backend(backend)
+
+
+def test_demo_defaults_do_not_require_timeout_argument():
+    allow_async_import_without_grpcio()
+    from lerobot.async_inference.robot_client_demo import DemoRobotClientConfig
+
+    assert DemoRobotClientConfig.__dataclass_fields__["backend"].default == "pi05_zmq"
+    assert DemoRobotClientConfig.__dataclass_fields__["zmq_timeout_ms"].default == 90000
+
+
+@pytest.mark.parametrize("backend", ["pi05_zmq", "pi05_thor"])
+def test_demo_normalizes_legacy_backend_without_mutating_config(monkeypatch, backend):
+    allow_async_import_without_grpcio()
+    import lerobot.async_inference.robot_client_demo as demo
+
+    @dataclass
+    class Config:
+        backend: str
+
+    config = Config(backend)
+    monkeypatch.setattr(demo.RobotClient, "__init__", lambda self, cfg: setattr(self, "backend", cfg.backend))
+    client = demo.DemoPi05RobotClient(config)
+    assert client.backend == "pi05_zmq"
+    assert config.backend == backend
+
+
+def test_request_cancellation_tracks_pause_resume_and_shutdown(monkeypatch):
+    client = make_client()
+    monkeypatch.setattr(client, "_start_ready_pose_worker", lambda: None)
+    client._request_generation = client.pause_generation
+    assert not client._request_cancelled()
+    client.pause_and_ready()
+    assert client._request_cancelled()
+    client.resume_from_pause()
+    client._complete_ready_pose_transition()
+    assert client._request_cancelled()  # Response predates both s and f.
+    client._request_generation = client.pause_generation
+    assert not client._request_cancelled()
+    client.shutdown_event.set()
+    assert client._request_cancelled()
+    assert not client._can_accept_remote_response(client.pause_generation)
+
+
+def test_failure_cleanup_cannot_override_newer_pause(monkeypatch):
+    client = make_client()
+    monkeypatch.setattr(client, "_start_ready_pose_worker", lambda: None)
+    generation = client.pause_generation
+    client.pause_and_ready()
+    client._discard_failed_request(generation)
+    assert client.pause_event.is_set()
+    assert not client.must_go.is_set()
+
+
+def test_receiver_retries_startup_and_timeout_preserves_pause_and_owns_socket(monkeypatch):
+    allow_async_import_without_grpcio()
+    import lerobot.async_inference.robot_client_demo as demo
+
+    client = make_client()
+    client.remote_client = None
+    client.config.zmq_timeout_ms = 90
+    monkeypatch.setattr(demo, "RECONNECT_DELAY_S", 0.01)
+    monkeypatch.setattr(client, "_start_ready_pose_worker", lambda: None)
+    recovered = threading.Event()
+    accepted = []
+    owners = []
+
+    class RetryingRemote:
+        pings = 0
+        actions = 0
+
+        def __init__(self, *args, **kwargs):
+            owners.append(threading.get_ident())
+
+        def ping(self, **kwargs):
+            self.pings += 1
+            if self.pings < 3:
+                return False
+            if self.pings == 4:
+                client.pause_and_ready()
+                recovered.set()
+            return True
+
+        def get_action(self, observation):
+            self.actions += 1
+            if self.actions == 1:
+                raise TimeoutError("simulated outage")
+            return {"actions": observation}
+
+        def close(self):
+            owners.append(threading.get_ident())
+
+    monkeypatch.setattr(demo, "Pi05ZMQClient", RetryingRemote)
+    monkeypatch.setattr(client, "_convert_remote_actions", lambda *args: [FakeTimedAction()])
+    monkeypatch.setattr(client, "_aggregate_action_queues", lambda *args: accepted.append(True))
+    assert client.start()
+    assert client.remote_client is None  # No blocking ping on the main thread.
+    worker = threading.Thread(target=client.receive_remote_actions)
+    worker.start()
+    client.start_barrier.wait(timeout=2)
+
+    def pump_until(predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            client._put_latest_remote_observation(
+                client.pause_generation, SimpleNamespace(get_timestep=lambda: 0), {},
+            )
+            time.sleep(0.01)
+        assert predicate()
+
+    try:
+        pump_until(recovered.is_set)
+        assert client.pause_event.is_set()
+        assert not accepted
+        client.resume_from_pause()
+        assert client.pause_event.is_set()  # f waits for ready motion.
+        client._complete_ready_pose_transition()
+        pump_until(lambda: bool(accepted))
+    finally:
+        client.shutdown_event.set()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert client.remote_client is None
+    assert client._receiver_done.is_set()
+    assert owners == [worker.ident, worker.ident]
+
+
+def test_waiting_for_missing_server_stops_promptly(monkeypatch):
+    allow_async_import_without_grpcio()
+    import lerobot.async_inference.robot_client_demo as demo
+
+    client = make_client()
+    attempted = threading.Event()
+
+    def ping(**kwargs):
+        attempted.set()
+        return False
+
+    client.remote_client = SimpleNamespace(ping=ping)
+    results = []
+    monkeypatch.setattr(demo, "RECONNECT_DELAY_S", 10)
+    worker = threading.Thread(target=lambda: results.append(client._wait_for_server()))
+    worker.start()
+    try:
+        assert attempted.wait(1)
+    finally:
+        client.shutdown_event.set()
+        worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert results == [False]
+
+
+def test_receiver_start_failure_does_not_block_shutdown(monkeypatch):
+    allow_async_import_without_grpcio()
+    import lerobot.async_inference.robot_client_demo as demo
+
+    client = make_client()
+    stopped = []
+    monkeypatch.setattr(demo, "DemoPi05RobotClient", lambda cfg: client)
+
+    def fail_start(self):
+        raise RuntimeError("cannot start thread")
+
+    def stop():
+        assert client._receiver_done.is_set()
+        stopped.append(True)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    monkeypatch.setattr(client, "stop", stop)
+
+    @dataclass
+    class Config:
+        debug_visualize_queue_size: bool = False
+
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        demo.async_client.__wrapped__(Config())
+    assert stopped == [True]

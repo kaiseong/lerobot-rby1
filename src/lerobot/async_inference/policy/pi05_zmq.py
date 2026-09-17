@@ -1,4 +1,6 @@
 import io
+import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -63,11 +65,12 @@ class MsgSerializer:
 
 
 class Pi05ZMQClient:
-    def __init__(self, server_address: str, timeout_ms: int):
+    def __init__(self, server_address: str, timeout_ms: int, *, cancelled: Callable[[], bool] | None = None):
         _, zmq = _import_zmq_dependencies()
         self._zmq = zmq
         self.address = normalize_zmq_server_address(server_address)
         self.timeout_ms = int(timeout_ms)
+        self._cancelled = cancelled
         self.ctx = zmq.Context()
         self.sock = self._create_socket()
 
@@ -84,14 +87,36 @@ class Pi05ZMQClient:
         self.sock.close()
         self.sock = self._create_socket()
 
-    def _call(self, endpoint: str, data: dict[str, Any] | None = None):
+    def _wait_for_socket(self, event: int, timeout_ms: int) -> None:
+        deadline = time.monotonic() + timeout_ms / 1000
+        while True:
+            if self._cancelled is not None and self._cancelled():
+                raise InterruptedError("Pi05 request cancelled")
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise self._zmq.Again()
+            if self.sock.poll(timeout=min(100, remaining_ms), flags=event):
+                return
+
+    def _call(self, endpoint: str, data: dict[str, Any] | None = None, *, timeout_ms: int | None = None):
         request: dict[str, Any] = {"endpoint": endpoint}
         if data is not None:
             request["data"] = data
 
         try:
-            self.sock.send(MsgSerializer.to_bytes(request))
-            raw = self.sock.recv()
+            payload = MsgSerializer.to_bytes(request)
+            if self._cancelled is not None or timeout_ms is not None:
+                request_timeout = self.timeout_ms if timeout_ms is None else timeout_ms
+                self._wait_for_socket(self._zmq.POLLOUT, request_timeout)
+                self.sock.send(payload, flags=self._zmq.NOBLOCK)
+                self._wait_for_socket(self._zmq.POLLIN, request_timeout)
+                raw = self.sock.recv(flags=self._zmq.NOBLOCK)
+            else:
+                self.sock.send(payload)
+                raw = self.sock.recv()
+        except InterruptedError:
+            self._reset_socket()
+            raise
         except self._zmq.Again as exc:
             self._reset_socket()
             raise TimeoutError(f"Server response timeout (endpoint={endpoint})") from exc
@@ -104,9 +129,9 @@ class Pi05ZMQClient:
             raise RuntimeError(f"Server error: {response['error']}")
         return response
 
-    def ping(self) -> bool:
+    def ping(self, *, timeout_ms: int | None = None) -> bool:
         try:
-            return bool(self._call("ping"))
+            return bool(self._call("ping", timeout_ms=timeout_ms))
         except Exception:
             return False
 

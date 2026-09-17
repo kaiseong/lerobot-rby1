@@ -29,7 +29,7 @@ import threading
 import time
 import tty
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from pprint import pformat
 from queue import Empty, Full, Queue
 from typing import Any
@@ -49,8 +49,17 @@ from .helpers import (
     visualize_action_queue_size,
 )
 from .robot_client import RobotClient
+from .policy.pi05_zmq import Pi05ZMQClient
 
 SUPPORTED_DEMO_BACKENDS = {"pi05_zmq", "pi05_thor"}
+RECONNECT_DELAY_S = 1.0
+
+
+@dataclass
+class DemoRobotClientConfig(RobotClientConfig):
+    backend: str = "pi05_zmq"
+    # Bound individual requests; the receiver retries indefinitely.
+    zmq_timeout_ms: int = 90000
 
 
 def validate_demo_backend(backend: str) -> None:
@@ -69,6 +78,7 @@ class DemoPi05RobotClient(RobotClient):
 
     def __init__(self, config: RobotClientConfig):
         validate_demo_backend(getattr(config, "backend", "grpc"))
+        config = replace(config, backend="pi05_zmq")
         super().__init__(config)
         self._init_demo_pause_state()
 
@@ -86,6 +96,42 @@ class DemoPi05RobotClient(RobotClient):
         self._terminal_lock = threading.Lock()
         self._terminal_fd: int | None = None
         self._terminal_attrs: list[Any] | None = None
+        self._request_generation: int | None = None
+        self._receiver_done = threading.Event()
+        self._receiver_done.set()
+
+    def start(self) -> bool:
+        # The receiver owns its ZMQ socket, including connection and cleanup.
+        self.shutdown_event.clear()
+        self._receiver_done.clear()
+        return True
+
+    def _request_cancelled(self) -> bool:
+        return self.shutdown_event.is_set() or (
+            self._request_generation is not None
+            and not self._can_accept_remote_response(self._request_generation)
+        )
+
+    def _wait_for_server(self) -> bool:
+        attempt = 0
+        while self.running:
+            if self.remote_client.ping(timeout_ms=1000):
+                self.logger.info("Connected to Pi05 server at %s", self.server_address)
+                return True
+            attempt += 1
+            if attempt == 1 or attempt % 10 == 0:
+                self.logger.warning("Waiting for Pi05 server at %s; retrying (attempt %s)", self.server_address, attempt)
+            if self.shutdown_event.wait(RECONNECT_DELAY_S):
+                break
+        return False
+
+    def _discard_failed_request(self, generation: int) -> None:
+        with self.policy_control_lock:
+            if not self._can_accept_remote_response(generation):
+                return
+            self._clear_action_queue()
+            self._drain_remote_observation_queue()
+            self.must_go.set()
 
     def _clear_action_queue(self) -> None:
         with self.action_queue_lock:
@@ -111,7 +157,8 @@ class DemoPi05RobotClient(RobotClient):
     def _can_accept_remote_response(self, generation: int) -> bool:
         with self.pause_state_lock:
             return (
-                generation == self.pause_generation
+                not self.shutdown_event.is_set()
+                and generation == self.pause_generation
                 and not self.pause_event.is_set()
                 and not self.ready_pose_in_progress
             )
@@ -494,33 +541,56 @@ class DemoPi05RobotClient(RobotClient):
         return True
 
     def receive_remote_actions(self, verbose: bool = False):
-        if not self.uses_remote_zmq_backend:
-            self.logger.debug("receive_remote_actions called for non-ZMQ backend; skipping")
-            return
-        if self.remote_client is None:
-            raise RuntimeError(
-                f"{self.remote_backend_name} client not started. "
-                "Run RobotClient.start() before requesting actions."
+        try:
+            self.remote_client = Pi05ZMQClient(
+                self.server_address,
+                self.config.zmq_timeout_ms,
+                cancelled=self._request_cancelled,
             )
-
-        self.start_barrier.wait()
-        self.logger.info("%s action receiving thread starting", self.remote_backend_name)
-
-        while self.running:
+            self.start_barrier.wait()
+            connected = False
+            while self.running:
+                if not connected:
+                    if not self._wait_for_server():
+                        break
+                    connected = True
+                    # Recovery must start from a new observation, not one captured
+                    # while the server was unavailable.
+                    with self.policy_control_lock:
+                        self._drain_remote_observation_queue()
+                        if not self._is_control_blocked():
+                            self.must_go.set()
+                try:
+                    generation, observation, remote_observation = self.remote_observation_queue.get(timeout=0.1)
+                except Empty:
+                    continue
+                if not self._can_accept_remote_response(generation):
+                    continue
+                try:
+                    self._request_generation = generation
+                    self._receive_and_enqueue_remote_actions(
+                        generation, observation, remote_observation, verbose=verbose,
+                    )
+                except InterruptedError:
+                    connected = False
+                except Exception as exc:
+                    self.logger.warning("Pi05 request failed; reconnecting with a fresh observation: %s", exc)
+                    self._discard_failed_request(generation)
+                    connected = False
+                    self.shutdown_event.wait(RECONNECT_DELAY_S)
+                finally:
+                    self._request_generation = None
+        except Exception:
+            self.logger.exception("Pi05 receiver failed")
+            self.shutdown_event.set()
+            self.start_barrier.abort()
+        finally:
             try:
-                generation, observation, remote_observation = self.remote_observation_queue.get(timeout=0.1)
-            except Empty:
-                continue
-
-            try:
-                self._receive_and_enqueue_remote_actions(
-                    generation,
-                    observation,
-                    remote_observation,
-                    verbose=verbose,
-                )
-            except Exception as exc:
-                self.logger.error("Error in %s action receiving loop: %s", self.remote_backend_name, exc)
+                if self.remote_client is not None:
+                    self.remote_client.close()
+                    self.remote_client = None
+            finally:
+                self._receiver_done.set()
 
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         if self.uses_remote_zmq_backend:
@@ -547,7 +617,11 @@ class DemoPi05RobotClient(RobotClient):
 
     def stop(self):
         self.shutdown_event.set()
+        self.start_barrier.abort()
         self._keyboard_stop_event.set()
+        # Polling requests notice shutdown within 100 ms. Only their owner
+        # thread closes the socket; never close it during a concurrent recv.
+        self._receiver_done.wait()
 
         if self._keyboard_thread is not None and self._keyboard_thread.is_alive():
             self._keyboard_thread.join(timeout=0.5)
@@ -565,21 +639,23 @@ class DemoPi05RobotClient(RobotClient):
 
 
 @draccus.wrap()
-def async_client(cfg: RobotClientConfig):
+def async_client(cfg: DemoRobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
     client = DemoPi05RobotClient(cfg)
 
     if client.start():
         action_receiver_thread = threading.Thread(target=client.receive_remote_actions, daemon=True)
-        action_receiver_thread.start()
-        client.start_keyboard_listener()
-
         try:
+            action_receiver_thread.start()
+            client.start_keyboard_listener()
             client.control_loop(task=cfg.task)
         finally:
+            if action_receiver_thread.ident is None:
+                client._receiver_done.set()
             client.stop()
-            action_receiver_thread.join(timeout=1.0)
+            if action_receiver_thread.ident is not None:
+                action_receiver_thread.join(timeout=1.0)
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")
