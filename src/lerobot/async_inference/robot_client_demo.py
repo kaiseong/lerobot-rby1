@@ -22,6 +22,7 @@ behind a separate entrypoint:
 """
 
 import logging
+import os
 import select
 import sys
 import termios
@@ -44,15 +45,19 @@ from .helpers import (
     Action,
     Observation,
     RawObservation,
+    TimedAction,
     TimedObservation,
     get_logger,
     visualize_action_queue_size,
 )
+from .infer_recorder import DiskLowError, InferenceRecorder, RequestRecord, create_recorder_for_client
 from .robot_client import RobotClient
 from .policy.pi05_zmq import Pi05ZMQClient
 
 SUPPORTED_DEMO_BACKENDS = {"pi05_zmq", "pi05_thor"}
 RECONNECT_DELAY_S = 1.0
+# 'w' never commands left_arm_6 past this (URDF limit is +-2.705 rad).
+LEFT_WRIST_LIMIT_RAD = 2.6
 
 
 @dataclass
@@ -60,6 +65,34 @@ class DemoRobotClientConfig(RobotClientConfig):
     backend: str = "pi05_zmq"
     # Bound individual requests; the receiver retries indefinitely.
     zmq_timeout_ms: int = 90000
+    # Left-right mirrored instruction. Keys 'a'/'b' switch between --task and this one at runtime.
+    task_mirrored: str = ""
+    # Debug recording (see infer_recorder.py) from startup; key 'r' turns it on/off at runtime.
+    debug_record: bool = False
+    # Each ON period is a new session folder <dir>/<YYYYmmdd_HHMMSS>/.
+    debug_record_dir: str = "~/infer_records"
+    # JPEG of the camera images that were sent to the server.
+    debug_record_images: bool = True
+    debug_record_jpeg_quality: int = 90
+    # SDK state stream rate; 0 = off.
+    debug_record_state_hz: float = 100.0
+    # Free text stored in meta.json, e.g. the checkpoint name.
+    debug_record_note: str = ""
+    # Below this free space stop images; below half of it stop recording.
+    debug_record_min_free_gb: float = 2.0
+    # 's' opens the grippers to this value (dataset convention: 1.0 = open, 0.0 = closed).
+    # JIMTOF_1022 / JIMTOF_1023v2 actions never open past 0.5; 1.0 is the mechanical limit.
+    pause_gripper_open: float = 1.0  # flower: open fully on s (JIMTOF used 0.5)
+    # minimum_time (s) of the 's' ready-pose motion; Rby1.move_to_ready_pose() defaults to 5.0.
+    ready_pose_min_time: float = 1.5
+    # 'w' turns the left wrist (left_arm_6) clockwise by this many degrees while the policy keeps running.
+    # Each press adds a turn commanded over wrist_nudge_s. The turn is held until the measured wrist gets there
+    # or wrist_nudge_settle_s after the last press; after that the policy owns the new angle. 's' clears it.
+    wrist_nudge_deg: float = 30.0
+    wrist_nudge_s: float = 0.3
+    wrist_nudge_settle_s: float = 1.5
+    # Same as --robot.torso_impedance=true: hold the torso with joint impedance control (joint mode).
+    torso_impedance: bool = False
 
 
 def validate_demo_backend(backend: str) -> None:
@@ -75,12 +108,21 @@ class DemoPi05RobotClient(RobotClient):
 
     prefix = "robot_client_demo"
     logger = get_logger(prefix)
+    recorder: InferenceRecorder | None = None
 
     def __init__(self, config: RobotClientConfig):
         validate_demo_backend(getattr(config, "backend", "grpc"))
         config = replace(config, backend="pi05_zmq")
+        if getattr(config, "torso_impedance", False):
+            if not hasattr(config.robot, "torso_impedance"):
+                raise ValueError("--torso_impedance needs the robot driver with Rby1Config.torso_impedance")
+            config = replace(config, robot=replace(config.robot, torso_impedance=True))
         super().__init__(config)
         self._init_demo_pause_state()
+        self.task_options = {"a": ("original", config.task)}
+        if getattr(config, "task_mirrored", ""):
+            self.task_options["b"] = ("mirrored", config.task_mirrored)
+        self.active_task_key = "a"
 
     def _init_demo_pause_state(self) -> None:
         self.pause_event = threading.Event()
@@ -99,12 +141,78 @@ class DemoPi05RobotClient(RobotClient):
         self._request_generation: int | None = None
         self._receiver_done = threading.Event()
         self._receiver_done.set()
+        # Held while a recorder is opened or closed; stop() sets the flag first, then waits for it.
+        self._record_toggle_lock = threading.Lock()
+        self._record_stopped = False
+        self._record_toggle_thread: threading.Thread | None = None
+        # 'w' turns of left_arm_6. A group starts at a press and collects the presses until the measured wrist
+        # gets there or it settles: {"ref": measured rad at the first press, "presses": [(time.time(), delta rad)],
+        # "done": time.time() it finished or None}. Cleared on pause.
+        self._wrist_nudge_lock = threading.Lock()
+        self._wrist_groups: list[dict[str, Any]] = []
+        self._wrist_last_l6: float | None = None
+        self._left_wrist_idx: int | None = None
 
     def start(self) -> bool:
         # The receiver owns its ZMQ socket, including connection and cleanup.
         self.shutdown_event.clear()
         self._receiver_done.clear()
+        self._record_stopped = False
+        if getattr(self.config, "debug_record", False):
+            with self._record_toggle_lock:
+                if self.recorder is None:
+                    self._open_debug_record()
         return True
+
+    def _open_debug_record(self) -> None:
+        """Start a new recording session. Caller holds _record_toggle_lock."""
+        try:
+            recorder = create_recorder_for_client(self)
+        except DiskLowError as exc:
+            self.logger.error("Debug recording not started: %s", exc)
+            return
+        except Exception as exc:
+            self.logger.exception("Debug recording not started: %s", exc)
+            return
+        self.recorder = recorder
+        self.logger.info("Debug recording ON -> %s", recorder.session_dir)
+
+    def _close_debug_record(self) -> None:
+        """Detach and close the current recorder. Caller holds _record_toggle_lock."""
+        recorder, self.recorder = self.recorder, None
+        if recorder is None:
+            return
+        # Threads that already hold it finish their hook; a closed recorder ignores late calls.
+        stopped_early = not recorder.active  # the disk guard stopped it during the session
+        recorder.close()
+        self.logger.info(
+            "Debug recording OFF (saved %s%s)",
+            recorder.session_dir, "; it had already stopped on low disk" if stopped_early else "",
+        )
+
+    def _toggle_debug_record(self) -> None:
+        with self._record_toggle_lock:
+            if self._record_stopped or self.shutdown_event.is_set():
+                return
+            if self.recorder is None:
+                self._open_debug_record()
+            else:
+                self._close_debug_record()
+
+    def request_debug_record_toggle(self) -> None:
+        """Key 'r': toggle on a worker so the keyboard ('s' pause) stays responsive."""
+        if self._record_toggle_thread is not None and self._record_toggle_thread.is_alive():
+            self.logger.info("Debug recording toggle already in progress; ignoring 'r'")
+            return
+        self._record_toggle_thread = threading.Thread(
+            target=self._toggle_debug_record, daemon=True, name="DebugRecordToggle"
+        )
+        self._record_toggle_thread.start()
+
+    def _record_event(self, name: str, **fields: Any) -> None:
+        recorder = self.recorder
+        if recorder is not None:
+            recorder.event(name, **fields)
 
     def _request_cancelled(self) -> bool:
         return self.shutdown_event.is_set() or (
@@ -117,8 +225,11 @@ class DemoPi05RobotClient(RobotClient):
         while self.running:
             if self.remote_client.ping(timeout_ms=1000):
                 self.logger.info("Connected to Pi05 server at %s", self.server_address)
+                self._record_event("server_connected", attempts=attempt + 1)
                 return True
             attempt += 1
+            if attempt == 1:
+                self._record_event("server_wait")
             if attempt == 1 or attempt % 10 == 0:
                 self.logger.warning("Waiting for Pi05 server at %s; retrying (attempt %s)", self.server_address, attempt)
             if self.shutdown_event.wait(RECONNECT_DELAY_S):
@@ -129,13 +240,17 @@ class DemoPi05RobotClient(RobotClient):
         with self.policy_control_lock:
             if not self._can_accept_remote_response(generation):
                 return
-            self._clear_action_queue()
+            cleared = self._clear_action_queue()
             self._drain_remote_observation_queue()
             self.must_go.set()
+        self._record_event("queue_cleared", reason="request_failed", generation=generation, cleared=cleared)
 
-    def _clear_action_queue(self) -> None:
+    def _clear_action_queue(self) -> int:
+        """Drop all queued actions; return how many were dropped."""
         with self.action_queue_lock:
+            cleared = self.action_queue.qsize()
             self.action_queue = Queue()
+        return cleared
 
     def _drain_remote_observation_queue(self) -> int:
         drained = 0
@@ -170,18 +285,24 @@ class DemoPi05RobotClient(RobotClient):
             with self.pause_state_lock:
                 self.pause_event.set()
                 self.pause_generation += 1
+                generation = self.pause_generation
                 self.resume_requested = False
 
                 if not self.ready_pose_in_progress:
                     self.ready_pose_in_progress = True
                     start_worker = True
 
-            self._clear_action_queue()
+            cleared = self._clear_action_queue()
             drained = self._drain_remote_observation_queue()
             self.must_go.clear()
+            with self._wrist_nudge_lock:
+                self._wrist_groups.clear()
 
         self.logger.info(
             "Paused policy control; cleared queued actions and drained %s remote observations", drained
+        )
+        self._record_event(
+            "pause", generation=generation, cleared=cleared, drained=drained, ready_pose=start_worker
         )
 
         if start_worker:
@@ -195,13 +316,14 @@ class DemoPi05RobotClient(RobotClient):
             if self.ready_pose_in_progress:
                 self.resume_requested = True
                 self.logger.info("Resume requested; deferring until ready-pose motion completes")
+                self._record_event("resume_deferred")
                 return
 
         self._resume_now()
 
     def _resume_now(self) -> None:
         with self.policy_control_lock:
-            self._clear_action_queue()
+            cleared = self._clear_action_queue()
             drained = self._drain_remote_observation_queue()
 
             with self.pause_state_lock:
@@ -221,6 +343,7 @@ class DemoPi05RobotClient(RobotClient):
             generation,
             drained,
         )
+        self._record_event("resume", generation=generation, cleared=cleared, drained=drained)
 
     def _start_ready_pose_worker(self) -> None:
         thread = threading.Thread(
@@ -238,8 +361,9 @@ class DemoPi05RobotClient(RobotClient):
             self._open_grippers_for_pause()
             move_to_ready_pose = getattr(self.robot, "move_to_ready_pose", None)
             if callable(move_to_ready_pose):
-                self.logger.info("Moving robot to ready pose")
-                move_to_ready_pose()
+                min_time = float(getattr(self.config, "ready_pose_min_time", 5.0))
+                self.logger.info("Moving robot to ready pose (minimum_time %.1f s)", min_time)
+                move_to_ready_pose(minimum_time=min_time)
                 ready_succeeded = True
             else:
                 self.logger.warning("Robot does not expose move_to_ready_pose(); staying paused")
@@ -260,15 +384,15 @@ class DemoPi05RobotClient(RobotClient):
             self.logger.warning("Robot gripper handle does not expose set_positions(); skipping gripper-open command")
             return False
 
+        # Rby1Gripper.set_positions() takes [right, left] with 0.0 = open, 1.0 = closed (the reverse of the dataset).
+        open_value = float(np.clip(getattr(self.config, "pause_gripper_open", 1.0), 0.0, 1.0))
         try:
-            # RB-Y1 gripper commands are side-specific in practice:
-            # right opens at 0.0, while the left opens at 1.0.
-            set_positions(np.array([0.0, 1.0], dtype=np.float64))
+            set_positions(np.full(2, 1.0 - open_value, dtype=np.float64))
         except Exception as exc:
             self.logger.exception("Failed to open grippers for pause/ready transition: %s", exc)
             return False
 
-        self.logger.info("Opened RB-Y1 grippers for pause/ready transition")
+        self.logger.info("Opened RB-Y1 grippers to %.2f (1.0 = fully open) for pause/ready transition", open_value)
         return True
 
     def _complete_ready_pose_transition(self, ready_succeeded: bool = True) -> None:
@@ -279,12 +403,100 @@ class DemoPi05RobotClient(RobotClient):
             if not should_resume:
                 self.resume_requested = False
 
+        self._record_event("ready_pose_done", succeeded=ready_succeeded)
         if should_resume:
             self._resume_now()
         elif ready_succeeded:
             self.logger.info("Ready-pose motion complete; client remains paused")
         else:
             self.logger.warning("Ready-pose motion did not complete; client remains paused")
+
+    def request_wrist_nudge(self) -> None:
+        """'w': turn the left wrist clockwise (left_arm_6 decreases) while the policy keeps running.
+
+        The policy predicts joint deltas from the observed state, so a chunk computed after the wrist has turned
+        already contains the turn. Each queued chunk therefore holds ``action - (turn its observation shows)``
+        and the control loop adds the commanded turn; a plain offset would be added again with every new chunk.
+        The wrist follows about 0.5 s late, so the part an observation shows is measured from its left_arm_6.
+        """
+        if self._is_control_blocked():
+            self.logger.info("'w' ignored while paused")
+            return
+        step = -np.deg2rad(float(getattr(self.config, "wrist_nudge_deg", 30.0)))
+        now = time.time()
+        with self._wrist_nudge_lock:
+            self._finish_wrist_groups(now)
+            group = self._wrist_groups[-1] if self._wrist_groups and self._wrist_groups[-1]["done"] is None else None
+            if group is None:
+                if self._wrist_last_l6 is None:
+                    self.logger.info("'w' ignored: no observation yet")
+                    return
+                group = {"ref": self._wrist_last_l6, "presses": [], "done": None}
+                self._wrist_groups.append(group)
+            group["presses"].append((now, step))
+            turn = sum(d for _, d in group["presses"])
+        self.logger.info("Turning left wrist %.0f deg (this turn %.0f deg)", np.degrees(step), np.degrees(turn))
+        self._record_event("wrist_nudge", delta_deg=float(np.degrees(step)), turn_deg=float(np.degrees(turn)))
+
+    def _finish_wrist_groups(self, now: float) -> None:
+        """Close the open 'w' turn once the measured wrist is within 3 deg of it or it has settled (lock held)."""
+        if not self._wrist_groups or self._wrist_groups[-1]["done"] is not None:
+            return
+        group = self._wrist_groups[-1]
+        turn = sum(d for _, d in group["presses"])
+        last_end = group["presses"][-1][0] + float(getattr(self.config, "wrist_nudge_s", 0.3))
+        reached = self._wrist_last_l6 is not None and abs(turn - (self._wrist_last_l6 - group["ref"])) <= np.deg2rad(3.0)
+        settled = now >= last_end + float(getattr(self.config, "wrist_nudge_settle_s", 1.5))
+        if now >= last_end and (reached or settled):
+            group["done"] = now
+
+    def _wrist_turn_sent(self, t: float) -> float:
+        """Extra left_arm_6 turn (rad) to send at time.time() ``t``: every press, ramped in over wrist_nudge_s."""
+        ramp = max(float(getattr(self.config, "wrist_nudge_s", 0.3)), 1e-3)
+        with self._wrist_nudge_lock:
+            self._finish_wrist_groups(t)
+            return sum(
+                d * min(max((t - t0) / ramp, 0.0), 1.0) for group in self._wrist_groups for t0, d in group["presses"]
+            )
+
+    def _wrist_turn_seen(self, t_obs: float, l6_obs: float | None) -> float:
+        """Part of the commanded turn (rad) that an observation taken at ``t_obs`` with left_arm_6 ``l6_obs`` shows."""
+        with self._wrist_nudge_lock:
+            seen = 0.0
+            for group in self._wrist_groups:
+                turn = sum(d for _, d in group["presses"])
+                if group["done"] is not None and t_obs >= group["done"]:
+                    seen += turn  # the policy owns this turn now
+                elif t_obs >= group["presses"][0][0] and l6_obs is not None:
+                    seen += min(max((l6_obs - group["ref"]) / turn, 0.0), 1.0) * turn
+            return seen
+
+    def _shift_left_wrist(self, timed_action: TimedAction, shift: float, clip: bool = False) -> TimedAction:
+        """Copy of ``timed_action`` with ``shift`` (rad) added to left_arm_6, optionally kept inside its limits."""
+        if self._left_wrist_idx is None:
+            self._left_wrist_idx = list(self.robot.action_features).index("left_arm_6")
+        action = timed_action.get_action().clone()
+        value = float(action[self._left_wrist_idx]) + shift
+        if clip:
+            value = float(np.clip(value, -LEFT_WRIST_LIMIT_RAD, LEFT_WRIST_LIMIT_RAD))
+        action[self._left_wrist_idx] = value
+        return replace(timed_action, action=action)
+
+    @property
+    def active_task(self) -> str:
+        return self.task_options[self.active_task_key][1]
+
+    def log_active_task(self) -> None:
+        label, task = self.task_options[self.active_task_key]
+        self.logger.info("Instruction [%s: %s] %r", self.active_task_key, label, task)
+
+    def select_task(self, key: str) -> None:
+        if key not in self.task_options:
+            self.logger.warning("No instruction for '%s'; pass --task_mirrored to enable it", key)
+            return
+        self.active_task_key = key
+        self.log_active_task()
+        self._record_event("task_switch", key=key, label=self.task_options[key][0])
 
     def start_keyboard_listener(self) -> bool:
         if self._keyboard_thread is not None and self._keyboard_thread.is_alive():
@@ -301,7 +513,12 @@ class DemoPi05RobotClient(RobotClient):
             name="DemoKeyboardListener",
         )
         self._keyboard_thread.start()
-        self.logger.info("Demo keyboard controls enabled: 's'=pause/ready/open-grippers, 'f'=resume")
+        self.logger.info(
+            "Demo keyboard controls enabled: 's'=pause/ready/open-grippers, 'f'=resume, "
+            "'a'=original instruction, 'b'=mirrored instruction, 'r'=debug recording on/off (now %s), "
+            "'w'=turn left wrist clockwise",
+            "on" if self.recorder is not None else "off",
+        )
         return True
 
     def _keyboard_loop(self) -> None:
@@ -315,15 +532,25 @@ class DemoPi05RobotClient(RobotClient):
             tty.setcbreak(fd)
 
             while self.running and not self._keyboard_stop_event.is_set():
-                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                readable, _, _ = select.select([fd], [], [], 0.1)
                 if not readable:
                     continue
 
-                key = sys.stdin.read(1).lower()
-                if key == "s":
-                    self.pause_and_ready()
-                elif key == "f":
-                    self.resume_from_pause()
+                # os.read, not buffered sys.stdin: keys that arrive together are all handled now.
+                data = os.read(fd, 64)
+                if not data:
+                    break  # stdin closed
+                for key in data.decode(errors="ignore").lower():
+                    if key == "s":
+                        self.pause_and_ready()
+                    elif key == "f":
+                        self.resume_from_pause()
+                    elif key in ("a", "b"):
+                        self.select_task(key)
+                    elif key == "r":
+                        self.request_debug_record_toggle()
+                    elif key == "w":
+                        self.request_wrist_nudge()
 
         except Exception as exc:
             self.logger.warning("Demo keyboard listener stopped: %s", exc)
@@ -354,17 +581,20 @@ class DemoPi05RobotClient(RobotClient):
         generation: int,
         observation: TimedObservation,
         remote_observation: dict[str, Any],
-    ) -> None:
+    ) -> TimedObservation | None:
+        """Queue the observation; return the not-yet-sent observation it replaced, if any."""
         payload = (generation, observation, remote_observation)
         try:
             self.remote_observation_queue.put_nowait(payload)
-            return
+            return None
         except Full:
             pass
 
+        replaced = None
         with suppress(Empty):
-            self.remote_observation_queue.get_nowait()
+            replaced = self.remote_observation_queue.get_nowait()[1]
         self.remote_observation_queue.put_nowait(payload)
+        return replaced
 
     def control_loop_remote_observation(self, task: str, verbose: bool = False) -> RawObservation | None:
         if not self.uses_remote_zmq_backend:
@@ -377,6 +607,8 @@ class DemoPi05RobotClient(RobotClient):
             start_time = time.perf_counter()
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
+            if "left_arm_6" in raw_observation:
+                self._wrist_last_l6 = float(raw_observation["left_arm_6"])  # reference for the next 'w'
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
@@ -399,7 +631,13 @@ class DemoPi05RobotClient(RobotClient):
             if not self._can_accept_remote_response(generation):
                 return None
 
-            self._put_latest_remote_observation(generation, observation, remote_observation)
+            replaced = self._put_latest_remote_observation(generation, observation, remote_observation)
+            recorder = self.recorder
+            if recorder is not None:
+                recorder.observation(
+                    observation, raw_observation, start_time, obs_capture_time,
+                    generation, current_queue_size, replaced, task,
+                )
 
             self.logger.debug(
                 "QUEUE SIZE: %s (Must go: %s) | Queued %s observation #%s (generation %s)",
@@ -431,10 +669,17 @@ class DemoPi05RobotClient(RobotClient):
 
         except Exception as exc:
             self.logger.error("Error in %s observation loop: %s", self.remote_backend_name, exc)
+            self._record_event("obs_error", error=repr(exc)[:200])
             return None
 
-    def control_loop_action(self, verbose: bool = False) -> dict[str, Any] | None:
-        """Pop and send one action unless policy control is paused."""
+    def control_loop_action(
+        self, verbose: bool = False, recorder: InferenceRecorder | None = None
+    ) -> dict[str, Any] | None:
+        """Pop and send one action unless policy control is paused.
+
+        ``recorder`` is the control loop's recorder for this iteration, so the
+        action and its tick land in the same session.
+        """
         with self.policy_control_lock:
             if self._is_control_blocked():
                 return None
@@ -448,12 +693,19 @@ class DemoPi05RobotClient(RobotClient):
                     return None
             get_end = time.perf_counter() - get_start
 
+            shift = self._wrist_turn_sent(time.time())
+            if shift:
+                timed_action = self._shift_left_wrist(timed_action, shift, clip=True)
             action = self._action_tensor_to_action_dict(timed_action.get_action())
 
             with self.latest_action_lock:
                 self.latest_action = timed_action.get_timestep()
 
             performed_action = self.robot.send_action(action)
+
+        if recorder is not None:
+            # action_queue_size[-1] is the queue size before this pop.
+            recorder.action_sent(timed_action, self.action_queue_size[-1])
 
         if verbose:
             with self.action_queue_lock:
@@ -479,20 +731,30 @@ class DemoPi05RobotClient(RobotClient):
         observation: TimedObservation,
         remote_observation: dict[str, Any],
         verbose: bool = False,
+        record: RequestRecord | None = None,
     ) -> bool:
         request_start = time.perf_counter()
         action_dict = self.remote_client.get_action(remote_observation)
         request_time = time.perf_counter() - request_start
+        if record is not None:
+            record.received(action_dict)
 
         if not self._can_accept_remote_response(generation):
             self.logger.info("Discarding stale %s action response for generation %s", self.remote_backend_name, generation)
+            if record is not None:
+                record.discard("stale_generation")
             return False
 
         timed_actions = self._convert_remote_actions(action_dict, observation)
+        # The observation already shows part of the 'w' turn; queue the chunk without that part.
+        seen = self._wrist_turn_seen(observation.get_timestamp(), observation.get_observation().get("left_arm_6"))
+        queued_actions = [self._shift_left_wrist(a, -seen) for a in timed_actions] if seen else timed_actions
 
         with self.policy_control_lock:
             if not self._can_accept_remote_response(generation):
                 self.logger.info("Discarding %s action response after conversion because state changed", self.remote_backend_name)
+                if record is not None:
+                    record.discard("state_changed_after_conversion")
                 return False
 
             self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
@@ -505,9 +767,13 @@ class DemoPi05RobotClient(RobotClient):
             else:
                 old_size, old_timesteps = 0, []
 
+            if record is not None:
+                record.before_aggregate(self.action_queue.qsize(), self.latest_action)
             queue_update_start = time.perf_counter()
-            self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
+            self._aggregate_action_queues(queued_actions, self.config.aggregate_fn)
             queue_update_time = time.perf_counter() - queue_update_start
+            if record is not None:
+                record.accept(timed_actions, self.action_queue.qsize())
 
             self.must_go.set()
 
@@ -566,20 +832,31 @@ class DemoPi05RobotClient(RobotClient):
                     continue
                 if not self._can_accept_remote_response(generation):
                     continue
+                record = None
+                # The request is ended on the recorder that began it, even if 'r' swaps it meanwhile.
+                recorder = self.recorder
                 try:
                     self._request_generation = generation
+                    if recorder is not None:
+                        record = recorder.begin_request(generation, observation, remote_observation)
                     self._receive_and_enqueue_remote_actions(
-                        generation, observation, remote_observation, verbose=verbose,
+                        generation, observation, remote_observation, verbose=verbose, record=record,
                     )
                 except InterruptedError:
+                    if record is not None:
+                        record.fail("interrupted")
                     connected = False
                 except Exception as exc:
                     self.logger.warning("Pi05 request failed; reconnecting with a fresh observation: %s", exc)
+                    if record is not None:
+                        record.fail(exc)
                     self._discard_failed_request(generation)
                     connected = False
                     self.shutdown_event.wait(RECONNECT_DELAY_S)
                 finally:
                     self._request_generation = None
+                    if record is not None:
+                        recorder.end_request(record)
         except Exception:
             self.logger.exception("Pi05 receiver failed")
             self.shutdown_event.set()
@@ -597,18 +874,24 @@ class DemoPi05RobotClient(RobotClient):
             self.start_barrier.wait()
 
         self.logger.info("Control loop thread starting")
+        # `task` is the initial ('a') instruction; the keyboard can switch it while running.
+        self.log_active_task()
 
         performed_action = None
         captured_observation = None
 
         while self.running:
             control_loop_start = time.perf_counter()
+            recorder = self.recorder
 
             if not self._is_control_blocked() and self.actions_available():
-                performed_action = self.control_loop_action(verbose)
+                performed_action = self.control_loop_action(verbose, recorder)
 
             if not self._is_control_blocked() and self._ready_to_send_observation():
-                captured_observation = self.control_loop_remote_observation(task, verbose)
+                captured_observation = self.control_loop_remote_observation(self.active_task, verbose)
+
+            if recorder is not None:
+                recorder.tick(control_loop_start, self._is_control_blocked())
 
             self.logger.debug("Control loop (ms): %.2f", (time.perf_counter() - control_loop_start) * 1000)
             time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
@@ -616,6 +899,8 @@ class DemoPi05RobotClient(RobotClient):
         return captured_observation, performed_action
 
     def stop(self):
+        # No 'r' toggle can open a new recorder once _record_stopped is set.
+        self._record_stopped = True
         self.shutdown_event.set()
         self.start_barrier.abort()
         self._keyboard_stop_event.set()
@@ -635,7 +920,15 @@ class DemoPi05RobotClient(RobotClient):
             if ready_pose_thread.is_alive():
                 self.logger.warning("Ready-pose worker is still running; continuing shutdown")
 
-        super().stop()
+        # Stop the SDK state stream and flush before the robot disconnects;
+        # the robot is disconnected even if closing the recorder fails.
+        try:
+            with self._record_toggle_lock:
+                self._close_debug_record()
+        except Exception:
+            self.logger.exception("Closing the debug recorder failed")
+        finally:
+            super().stop()
 
 
 @draccus.wrap()

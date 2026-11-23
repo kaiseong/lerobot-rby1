@@ -30,6 +30,10 @@ from .constants import (
 # Aggregate function registry for CLI usage
 AGGREGATE_FUNCTIONS = {
     "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
+    "weighted_90": lambda old, new: 0.1 * old + 0.9 * new,
+    "weighted_80": lambda old, new: 0.2 * old + 0.8 * new,
+    "weighted_60": lambda old, new: 0.4 * old + 0.6 * new,
+    "weighted_50": lambda old, new: 0.5 * old + 0.5 * new,
     "latest_only": lambda old, new: new,
     "average": lambda old, new: 0.5 * old + 0.5 * new,
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
