@@ -117,7 +117,7 @@ from .policy.pi05_zmq import (
 
 
 
-from .configs import RobotClientConfig
+from .configs import RobotClientConfig, crossfade
 from .helpers import (
     Action,
     FPSTracker,
@@ -415,6 +415,19 @@ class RobotClient:
                 if old_action.get_timestep() in protected_timesteps:
                     future_action_queue.put(old_action)
 
+            def is_overlap(timestep: int) -> bool:
+                return (
+                    timestep > latest_action
+                    and timestep not in protected_timesteps
+                    and timestep in current_action_queue
+                )
+
+            # crossfade: the new chunk's weight rises linearly over the overlap (k-th of n steps),
+            # or over its first `crossfade_steps` steps; the rest of the overlap is the new chunk.
+            overlap_count = sum(is_overlap(a.get_timestep()) for a in incoming_actions)
+            ramp_steps = min(self.config.crossfade_steps, overlap_count) or overlap_count
+            overlap_index = 0
+
             for new_action in incoming_actions:
                 timestep = new_action.get_timestep()
                 if timestep <= latest_action or timestep in protected_timesteps:
@@ -424,12 +437,15 @@ class RobotClient:
                     future_action_queue.put(new_action)
                     continue
 
+                old_action = current_action_queue[timestep]
+                overlap_index += 1
+                if aggregate_fn is crossfade:
+                    new_weight = min(1.0, overlap_index / (ramp_steps + 1))
+                    action = crossfade(old_action, new_action.get_action(), new_weight)
+                else:
+                    action = aggregate_fn(old_action, new_action.get_action())
                 future_action_queue.put(
-                    TimedAction(
-                        timestamp=new_action.get_timestamp(),
-                        timestep=timestep,
-                        action=aggregate_fn(current_action_queue[timestep], new_action.get_action()),
-                    )
+                    TimedAction(timestamp=new_action.get_timestamp(), timestep=timestep, action=action)
                 )
             self.action_queue = future_action_queue
 

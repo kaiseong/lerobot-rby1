@@ -27,8 +27,16 @@ from .constants import (
     SUPPORTED_BACKENDS,
 )
 
+
+def crossfade(old: torch.Tensor, new: torch.Tensor, new_weight: float = 0.5) -> torch.Tensor:
+    """Linear cross-fade. The client raises `new_weight` step by step across the overlap, so no
+    single step jumps from the old chunk to the new one."""
+    return (1 - new_weight) * old + new_weight * new
+
+
 # Aggregate function registry for CLI usage
 AGGREGATE_FUNCTIONS = {
+    "crossfade": crossfade,
     "weighted_average": lambda old, new: 0.3 * old + 0.7 * new,
     "weighted_90": lambda old, new: 0.1 * old + 0.9 * new,
     "weighted_80": lambda old, new: 0.2 * old + 0.8 * new,
@@ -176,6 +184,13 @@ class RobotClientConfig:
         default="weighted_average",
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
+    crossfade_steps: int = field(
+        default=0,
+        metadata={
+            "help": "With aggregate_fn_name=crossfade: number of overlap steps the new chunk takes to "
+            "reach full weight. 0 = the whole overlap"
+        },
+    )
 
     # Debug configuration
     debug_visualize_queue_size: bool = field(
@@ -247,6 +262,9 @@ class RobotClientConfig:
             normalized_crop_params[key] = (top, left, height, width)
         self.image_crop_params = normalized_crop_params
 
+        if self.crossfade_steps < 0:
+            raise ValueError(f"crossfade_steps must be non-negative, got {self.crossfade_steps}")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -274,4 +292,5 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "crossfade_steps": self.crossfade_steps,
         }

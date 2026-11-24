@@ -117,6 +117,59 @@ def test_update_action_queue_keeps_full_initial_chunk(robot_client):
     assert [a.get_timestep() for a in robot_client.action_queue.queue] == list(range(40))
 
 
+def test_aggregate_action_queues_crossfade_ramps_over_overlap(robot_client):
+    """`crossfade` raises the new chunk's weight linearly over the overlap, so every step changes
+    by the same small share of the old-new difference."""
+    from lerobot.async_inference.configs import crossfade
+    from lerobot.async_inference.helpers import TimedAction
+
+    robot_client.latest_action = 4
+    for a in _make_actions(start_ts=time.time(), start_t=5, count=10):  # 5..14, all 10.0
+        robot_client.action_queue.put(
+            TimedAction(action=torch.full((6,), 10.0), timestep=a.get_timestep(), timestamp=a.get_timestamp())
+        )
+    incoming = [
+        TimedAction(action=torch.full((6,), 1.0), timestep=a.get_timestep(), timestamp=a.get_timestamp())
+        for a in _make_actions(start_ts=time.time(), start_t=3, count=14)  # 3..16, all 1.0
+    ]
+
+    robot_client._aggregate_action_queues(incoming, aggregate_fn=crossfade)
+
+    values = {a.get_timestep(): a.get_action()[0].item() for a in robot_client.action_queue.queue}
+    assert sorted(values) == list(range(5, 17))
+    assert values[5] == values[6] == 10.0  # protected: old chunk
+    for k, timestep in enumerate(range(7, 15), start=1):  # 8 overlap steps: new weight k/9
+        assert values[timestep] == pytest.approx(10.0 - 9.0 * k / 9)
+    assert values[15] == values[16] == 1.0  # beyond the old queue: new chunk
+    steps = [values[t] - values[t + 1] for t in range(6, 15)]
+    assert steps == pytest.approx([1.0] * 9)  # no jump at either end of the overlap
+
+
+def test_aggregate_action_queues_crossfade_steps_shortens_the_ramp(robot_client):
+    """With `crossfade_steps`, the new chunk reaches full weight after that many overlap steps."""
+    from lerobot.async_inference.configs import crossfade
+    from lerobot.async_inference.helpers import TimedAction
+
+    robot_client.config.crossfade_steps = 4
+    robot_client.latest_action = 4
+    for timestep in range(5, 15):  # 5..14, all 10.0
+        robot_client.action_queue.put(
+            TimedAction(action=torch.full((6,), 10.0), timestep=timestep, timestamp=time.time())
+        )
+    incoming = [
+        TimedAction(action=torch.full((6,), 1.0), timestep=timestep, timestamp=time.time())
+        for timestep in range(3, 17)  # 3..16, all 1.0
+    ]
+
+    robot_client._aggregate_action_queues(incoming, aggregate_fn=crossfade)
+
+    values = {a.get_timestep(): a.get_action()[0].item() for a in robot_client.action_queue.queue}
+    assert values[5] == values[6] == 10.0  # protected: old chunk
+    for k, timestep in enumerate(range(7, 11), start=1):  # 4 ramp steps: new weight k/5
+        assert values[timestep] == pytest.approx(10.0 - 9.0 * k / 5)
+    assert all(values[timestep] == 1.0 for timestep in range(11, 17))  # ramp done: new chunk
+
+
 @pytest.mark.parametrize(
     "weight_old, weight_new",
     [
